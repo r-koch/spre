@@ -7,36 +7,27 @@
 		<artifactId>java</artifactId>
 		<version>0.0.1-SNAPSHOT</version>
 	</parent>
-	<artifactId>news-collector</artifactId>
+	<artifactId>local-collectors</artifactId>
 	<dependencies>
+		<dependency>
+			<groupId>dev.rkoch.spre</groupId>
+			<artifactId>aws-utils</artifactId>
+		</dependency>
 		<dependency>
 			<groupId>dev.rkoch.spre</groupId>
 			<artifactId>collector-utils</artifactId>
 		</dependency>
 		<dependency>
 			<groupId>dev.rkoch.spre</groupId>
-			<artifactId>s3-parquet</artifactId>
+			<artifactId>news-collector</artifactId>
+		</dependency>
+		<dependency>
+			<groupId>dev.rkoch.spre</groupId>
+			<artifactId>stock-collector</artifactId>
 		</dependency>
 		<dependency>
 			<groupId>com.amazonaws</groupId>
 			<artifactId>aws-lambda-java-core</artifactId>
-			<scope>provided</scope>
-		</dependency>
-		<dependency>
-			<groupId>org.json</groupId>
-			<artifactId>json</artifactId>
-		</dependency>
-		<dependency>
-			<groupId>org.slf4j</groupId>
-			<artifactId>slf4j-nop</artifactId>
 		</dependency>
 	</dependencies>
-	<build>
-		<plugins>
-			<plugin>
-				<groupId>org.apache.maven.plugins</groupId>
-				<artifactId>maven-shade-plugin</artifactId>
-			</plugin>
-		</plugins>
-	</build>
 </project>
