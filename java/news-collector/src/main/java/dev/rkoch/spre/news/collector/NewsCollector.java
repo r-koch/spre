@@ -16,6 +16,7 @@ import org.json.JSONObject;
 import com.amazonaws.services.lambda.runtime.Context;
 import com.amazonaws.services.lambda.runtime.LambdaLogger;
 import com.amazonaws.services.lambda.runtime.logging.LogLevel;
+import dev.rkoch.spre.collector.utils.Environment;
 import dev.rkoch.spre.collector.utils.State;
 
 public class NewsCollector {
@@ -25,15 +26,21 @@ public class NewsCollector {
   private static final String API_URL =
       "https://content.guardianapis.com/search?api-key=%s&show-fields=bodyText&lang=en&page-size=50&from-date=%s&to-date=%s&page=%s";
 
-  private static final long API_CALL_MIN_FREQUENCY_MILLIS = 1010;
+  private static final long API_CALL_MIN_FREQUENCY_MILLIS = Environment.get("API_CALL_MIN_FREQUENCY_MILLIS", 1010);
 
-  private static final String BUCKET_NAME = "dev-rkoch-spre";
+  private static final LocalDate AV_START_DATE = LocalDate.parse(Environment.get("AV_START_DATE", "1999-11-01"));
 
-  private static final long MIN_REMAINING_TIME_MILLIS = 30 * 1000; // 30 sec
+  private static final String BUCKET_NAME = Environment.get("BUCKET_NAME", "dev-rkoch-spre");
 
-  private static final String PARQUET_KEY = "raw/news/localDate=%s/data.parquet";
+  private static final String LAST_ADDED = "lastAdded";
 
-  private static final String PILLAR_NEWS = "pillar/news";
+  private static final long MIN_REMAINING_TIME_MILLIS = Environment.get("MIN_REMAINING_TIME_MILLIS", 30_000); // 30 sec
+
+  private static final String PARQUET_KEY = Environment.get("STATE_KEY", "raw/news/localDate=%s/data.parquet");
+
+  private static final String PILLAR_ID = "pillar/news";
+
+  private static final String STATE_KEY = Environment.get("STATE_KEY", "metadata/news_collector_state.json");
 
   private final Context context;
 
@@ -50,10 +57,10 @@ public class NewsCollector {
   }
 
   public void collect() {
-    try (State state = new State(handler.getS3Client(), BUCKET_NAME)) {
-      LocalDate date = getStartDate(state);
-      LocalDate now = LocalDate.now();
-      collect(state, date, now);
+    try (State state = new State(handler.getS3Client(), BUCKET_NAME, STATE_KEY)) {
+      LocalDate start = getStartDate(state);
+      LocalDate end = LocalDate.now();
+      collect(state, start, end);
     }
   }
 
@@ -67,7 +74,7 @@ public class NewsCollector {
           insert(date, records);
           logger.log("%s inserted".formatted(date), LogLevel.INFO);
         }
-        state.setLastAddedNewsDate(date);
+        state.setDate(LAST_ADDED, date);
       } catch (LimitExceededException e) {
         logger.log("theguardian limit exceeded".formatted(date), LogLevel.INFO);
         return;
@@ -82,7 +89,7 @@ public class NewsCollector {
     return context.getRemainingTimeInMillis() >= MIN_REMAINING_TIME_MILLIS;
   }
 
-  private List<NewsRecord> getData(final LocalDate date) throws LimitExceededException {
+  private List<NewsRecord> getData(final LocalDate date) throws LimitExceededException, IOException, InterruptedException {
     List<NewsRecord> items = new ArrayList<>();
     try {
       JSONObject response = getJson(date, 1);
@@ -104,7 +111,7 @@ public class NewsCollector {
       JSONObject result = results.getJSONObject(i);
       try {
         String pillarId = result.getString("pillarId");
-        if (PILLAR_NEWS.equalsIgnoreCase(pillarId)) {
+        if (PILLAR_ID.equalsIgnoreCase(pillarId)) {
           String body = result.getJSONObject("fields").getString("bodyText");
           if (!body.isBlank()) {
             String id = result.getString("id");
@@ -119,22 +126,18 @@ public class NewsCollector {
     return items;
   }
 
-  private JSONObject getJson(final LocalDate date, final int page) {
-    try {
-      HttpRequest httpRequest = HttpRequest.newBuilder(getUri(date, date, page)).build();
-      waitBeforeApiCall();
-      HttpResponse<String> httpResponse = handler.getHttpClient().send(httpRequest, BodyHandlers.ofString());
-      String body = httpResponse.body();
-      return new JSONObject(body).getJSONObject("response");
-    } catch (IOException | InterruptedException e) {
-      throw new RuntimeException(e);
-    }
+  private JSONObject getJson(final LocalDate date, final int page) throws IOException, InterruptedException {
+    HttpRequest httpRequest = HttpRequest.newBuilder(getUri(date, date, page)).build();
+    waitBeforeApiCall();
+    HttpResponse<String> httpResponse = handler.getHttpClient().send(httpRequest, BodyHandlers.ofString());
+    String body = httpResponse.body();
+    return new JSONObject(body).getJSONObject("response");
   }
 
   private LocalDate getStartDate(final State state) {
-    LocalDate lastAddedNewsDate = state.getLastAddedNewsDate();
+    LocalDate lastAddedNewsDate = state.getDate(LAST_ADDED);
     if (lastAddedNewsDate == null) {
-      return state.getAvStartDate();
+      return AV_START_DATE;
     } else {
       return lastAddedNewsDate.plusDays(1);
     }
@@ -144,13 +147,17 @@ public class NewsCollector {
     return URI.create(API_URL.formatted(handler.getApiKey(), from.toString(), to.toString(), page));
   }
 
-  private void insert(final LocalDate date, final List<NewsRecord> items) throws Exception {
-    handler.getS3Parquet().write(BUCKET_NAME, PARQUET_KEY.formatted(date), items);
+  private void insert(final LocalDate date, final List<NewsRecord> records) throws Exception {
+    handler.getS3Parquet().write(BUCKET_NAME, PARQUET_KEY.formatted(date), records);
   }
 
-  private void waitBeforeApiCall() throws InterruptedException {
+  private void waitBeforeApiCall() {
     long sleepMillis = lastApiCallMillis + API_CALL_MIN_FREQUENCY_MILLIS - System.currentTimeMillis();
-    Thread.sleep(Duration.ofMillis(sleepMillis));
+    try {
+      Thread.sleep(Duration.ofMillis(sleepMillis));
+    } catch (InterruptedException e) {
+      logger.log(e.getMessage(), LogLevel.ERROR);
+    }
     lastApiCallMillis = System.currentTimeMillis();
   }
 

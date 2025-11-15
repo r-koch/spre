@@ -13,7 +13,8 @@ public class LocalNewsCollector {
 
   public static void main(String[] args) {
     // new NewsCollector(new SystemOutLambdaLogger(), new Handler()).collect();
-    State state = new State(S3Client.builder().region(Region.EU_WEST_1).httpClientBuilder(UrlConnectionHttpClient.builder()).build(), "dev-rkoch-spre-test");
+    State state = new State(S3Client.builder().region(Region.EU_WEST_1).httpClientBuilder(UrlConnectionHttpClient.builder()).build(), "dev-rkoch-spre-test",
+        "state.json");
     LocalDate end = LocalDate.parse("1999-11-01");
     new NewsCollector(new LocalContext(), new Handler()).collect(state, end.minusDays(5), end);
   }

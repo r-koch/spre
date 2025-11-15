@@ -10,6 +10,8 @@ import software.amazon.awssdk.services.s3.S3Client;
 
 public class Handler implements RequestHandler<Void, Void> {
 
+  private static final String ENV_AWS_REGION = "AWS_REGION";
+
   private HttpClient httpClient;
 
   private S3Client s3Client;
@@ -25,7 +27,7 @@ public class Handler implements RequestHandler<Void, Void> {
 
   S3Client getS3Client() {
     if (s3Client == null) {
-      s3Client = S3Client.builder().region(Region.of(System.getenv("AWS_REGION"))).httpClientBuilder(UrlConnectionHttpClient.builder()).build();
+      s3Client = S3Client.builder().region(Region.of(System.getenv(ENV_AWS_REGION))).httpClientBuilder(UrlConnectionHttpClient.builder()).build();
     }
     return s3Client;
   }
@@ -39,7 +41,7 @@ public class Handler implements RequestHandler<Void, Void> {
 
   @Override
   public Void handleRequest(Void input, Context context) {
-    new StockCollector(context.getLogger(), this).collect();
+    new StockCollector(context, this).collect();
     return null;
   }
 

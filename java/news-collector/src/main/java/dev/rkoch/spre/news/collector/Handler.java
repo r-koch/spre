@@ -11,7 +11,9 @@ import software.amazon.awssdk.services.s3.S3Client;
 
 public class Handler implements RequestHandler<Void, Void> {
 
-  private static final String THEGUARDIAN_API_KEY = "THEGUARDIAN_API_KEY";
+  private static final String ENV_AWS_REGION = "AWS_REGION";
+
+  private static final String ENV_THEGUARDIAN_API_KEY = "THEGUARDIAN_API_KEY";
 
   private String apiKey;
 
@@ -23,7 +25,7 @@ public class Handler implements RequestHandler<Void, Void> {
 
   String getApiKey() {
     if (apiKey == null) {
-      apiKey = System.getenv(THEGUARDIAN_API_KEY);
+      apiKey = System.getenv(ENV_THEGUARDIAN_API_KEY);
     }
     return apiKey;
   }
@@ -37,7 +39,7 @@ public class Handler implements RequestHandler<Void, Void> {
 
   S3Client getS3Client() {
     if (s3Client == null) {
-      s3Client = S3Client.builder().region(Region.of(System.getenv("AWS_REGION"))).httpClientBuilder(UrlConnectionHttpClient.builder()).build();
+      s3Client = S3Client.builder().region(Region.of(System.getenv(ENV_AWS_REGION))).httpClientBuilder(UrlConnectionHttpClient.builder()).build();
     }
     return s3Client;
   }
