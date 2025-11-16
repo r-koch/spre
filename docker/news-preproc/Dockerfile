@@ -2,7 +2,7 @@
 FROM public.ecr.aws/lambda/python:3.11
 
 # Set Hugging Face home
-ENV TRANSFORMERS_CACHE=/tmp/transformers_cache
+ENV HF_HOME=/tmp/hf_home
 
 # Install minimal system dependencies
 RUN yum install -y git && yum clean all
@@ -19,7 +19,7 @@ RUN pip install --no-cache-dir torch==2.6.0 --index-url https://download.pytorch
 RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install --no-cache-dir huggingface_hub
 
-# download the model into /opt/finbert_model and move to a stable folder
+# download the model and move to a stable folder
 RUN mkdir -p /tmp/finbert_model && \
     mkdir -p ${LAMBDA_TASK_ROOT}/finbert_model && \
     python - <<'PY'
