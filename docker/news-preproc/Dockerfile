@@ -37,5 +37,7 @@ shutil.copytree(repo_path, TARGET_DIR)
 shutil.rmtree(CACHE_DIR, ignore_errors=True)
 PY
 
+ENV MODEL_DIR=${LAMBDA_TASK_ROOT}/finbert_model
+
 # Set Lambda handler
-CMD ["main.lambda_handler"]
+CMD ["preproc.lambda_handler"]

@@ -1,5 +1,7 @@
+import logging
 import os
 import re
+import time
 from io import BytesIO
 from datetime import timedelta, datetime
 import boto3
@@ -10,9 +12,12 @@ import torch
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
 # ---------- CONFIG ----------
-BUCKET = "dev-rkoch-spre"
-REGION = "eu-west-1"
-LAG_DAYS = 5  # configurable
+BUCKET = os.environ.get("BUCKET", "dev-rkoch-spre")
+REGION = os.environ.get("AWS_REGION", "eu-west-1")
+LAG_DAYS = int(os.environ.get("LAG_DAYS", "5"))
+START_DATE = os.environ.get("START_DATE", "1999-11-01")
+MIN_REMAINING_MS = int(os.environ.get("MIN_REMAINING_MS", "60000"))
+MODEL_NAME_OR_DIR = os.environ.get("MODEL_DIR", "ProsusAI/finbert")  # locally use model name, in docker use env
 
 RAW_PREFIX = "raw/news/localDate="
 PROCESSED_PREFIX = "processed/news/localDate="
@@ -21,24 +26,44 @@ LAGGED_KEY = f"lagged_{LAG_DAYS}/news/data.parquet"
 EXTRA_SYMBOLS = "•™£€¥"
 ALLOWED_CHARS = rf"a-zA-Z0-9\s{re.escape(EXTRA_SYMBOLS)}.,;:!?%$\/\-@&"
 
-MODEL_DIR = "/var/task/finbert_model"
-
 s3 = boto3.client("s3", region_name=REGION)
 
-# ---------- MODEL ----------
-tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR, local_files_only=True)
-model = AutoModelForSequenceClassification.from_pretrained(MODEL_DIR, local_files_only=True)
-model.eval()
+# ---------- LOGGING CONFIG ----------
+def setup_logger():
+    logger = logging.getLogger(__name__)
+    if logger.hasHandlers():
+        logger.handlers.clear()
+
+    handler = logging.StreamHandler()
+    if "AWS_LAMBDA_FUNCTION_NAME" in os.environ:
+        formatter = logging.Formatter("[%(levelname)s] %(message)s")
+        logger.setLevel(logging.INFO)
+    else:
+        formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s:%(lineno)d - %(message)s")
+        logger.setLevel(logging.DEBUG)
+
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    return logger
+
+
+logger = setup_logger()
+
+# ---------- MODEL (Lazy Loaded) ----------
+tokenizer = None
+model = None
+
+def get_model():
+    global tokenizer, model
+    if tokenizer is None or model is None:
+        is_docker = "MODEL_DIR" in os.environ
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME_OR_DIR, local_files_only=is_docker)
+        model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME_OR_DIR, local_files_only=is_docker)
+        model.eval()
+    return tokenizer, model
+
 
 # ---------- HELPERS ----------
-def s3_key_exists(bucket, key):
-    try:
-        s3.head_object(Bucket=bucket, Key=key)
-        return True
-    except s3.exceptions.ClientError:
-        return False
-
-
 def read_parquet_s3(bucket, key):
     obj = s3.get_object(Bucket=bucket, Key=key)
     buf = BytesIO(obj["Body"].read())
@@ -53,11 +78,15 @@ def write_parquet_s3(df, bucket, key):
 
 
 def append_parquet_s3(df_new, bucket, key):
-    if s3_key_exists(bucket, key):
+    try:
         existing = read_parquet_s3(bucket, key)
         combined = pd.concat([existing, df_new], ignore_index=True)
-    else:
-        combined = df_new
+    except s3.exceptions.ClientError as e:
+        if e.response['Error']['Code'] == "NoSuchKey":
+            combined = df_new
+        else:
+            raise
+        
     combined = combined.sort_values("localDate").drop_duplicates(subset=["localDate"])
     write_parquet_s3(combined, bucket, key)
 
@@ -75,6 +104,7 @@ def clean_text(text: str) -> str:
 def analyze_sentiment(texts):
     if not texts:
         return []
+    tokenizer, model = get_model()
     encodings = tokenizer(texts, padding=True, truncation=True, max_length=128, return_tensors="pt")
     outputs = model(**encodings)
     probs = torch.nn.functional.softmax(outputs.logits, dim=-1)
@@ -97,58 +127,73 @@ def process_single_day(local_date: str):
     input_key = f"{RAW_PREFIX}{local_date}/data.parquet"
     output_key = f"{PROCESSED_PREFIX}{local_date}/data.parquet"
 
-    if not s3_key_exists(BUCKET, input_key):
-        return None  # no raw data
+    try:
+        return read_parquet_s3(BUCKET, output_key)
+    except s3.exceptions.ClientError:
+        pass  # not yet processed, continue
 
-    if s3_key_exists(BUCKET, output_key):
-        return read_parquet_s3(BUCKET, output_key)  # already processed
+    try:
+        df = read_parquet_s3(BUCKET, input_key)
+        if df.empty:
+            raise ValueError(f"Raw parquet {input_key} is unexpectedly empty")
 
-    df = read_parquet_s3(BUCKET, input_key)
-    if df.empty:
-        return None
+        df["title_clean"] = df["title"].map(clean_text)
+        df["body_clean"] = df["body"].map(clean_text)
+        df["text_clean"] = df["title_clean"] + " " + df["body_clean"]
 
-    df["title_clean"] = df["title"].map(clean_text)
-    df["body_clean"] = df["body"].map(clean_text)
-    df["text_clean"] = df["title_clean"] + " " + df["body_clean"]
+        # Sentiment
+        batch_size = 32
+        scores = []
+        for i in range(0, len(df), batch_size):
+            batch = df["text_clean"].iloc[i : i + batch_size].tolist()
+            scores.extend(analyze_sentiment(batch))
+        df["sentiment_score"] = scores
 
-    # Sentiment
-    batch_size = 32
-    scores = []
-    for i in range(0, len(df), batch_size):
-        batch = df["text_clean"].iloc[i : i + batch_size].tolist()
-        scores.extend(analyze_sentiment(batch))
-    df["sentiment_score"] = scores
+        # Aggregate per day (single date)
+        result = pd.DataFrame(
+            {
+                "localDate": [local_date],
+                "count_articles": [len(df)],
+                "mean_sentiment": [df["sentiment_score"].mean()],
+            }
+        )
 
-    # Aggregate per day (single date)
-    result = pd.DataFrame(
-        {
-            "localDate": [local_date],
-            "count_articles": [len(df)],
-            "mean_sentiment": [df["sentiment_score"].mean()],
-        }
-    )
-
-    write_parquet_s3(result, BUCKET, output_key)
-    return result
+        write_parquet_s3(result, BUCKET, output_key)
+        return result
+    except s3.exceptions.ClientError as e:
+        if e.response['Error']['Code'] == "NoSuchKey":
+            return None
+        else:
+            raise
 
 
-def find_next_target_date():
+def find_start_date():
     """Find earliest t not yet processed in lagged_<LAG_DAYS> file."""
-    if not s3_key_exists(BUCKET, LAGGED_KEY):
-        return "1999-11-01"
+    try:
+        df = read_parquet_s3(BUCKET, LAGGED_KEY)
+        last_date = pd.to_datetime(df["localDate"]).max().date()
+        return last_date + timedelta(days=1)
+    except s3.exceptions.ClientError as e:
+        if e.response['Error']['Code'] == "NoSuchKey":
+            return datetime.strptime(START_DATE, "%Y-%m-%d").date()
+        else:
+            raise
 
-    df = read_parquet_s3(BUCKET, LAGGED_KEY)
-    last_date = pd.to_datetime(df["localDate"]).max()
-    return (last_date + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
 
-
-def generate_lagged_features():
+def generate_lagged_features(context=None):
     """Main orchestration"""
-    t = find_next_target_date()
+    
+    current = find_start_date()
+    now = datetime.now().date()
 
-    while True:
+    while current < now:
+
+        if context is not None and int(context.get_remaining_time_in_millis()) < MIN_REMAINING_MS:
+            logger.warning(f"Stopping early at {current} to avoid timeout (remaining_ms={context.get_remaining_time_in_millis()}).")
+            break
+
         lag_dates = [
-            (pd.to_datetime(t) - timedelta(days=i)).strftime("%Y-%m-%d")
+            (current - timedelta(days=i)).strftime("%Y-%m-%d")
             for i in range(1, LAG_DAYS + 1)
         ]
 
@@ -161,10 +206,10 @@ def generate_lagged_features():
                 processed_data[d] = agg
 
         if all_missing:
-            print(f"Stopping at {t}: all {LAG_DAYS} previous raw days missing.")
+            logger.warning(f"Stopping at {current}: all {LAG_DAYS} previous raw days missing.")
             break
 
-        row = {"localDate": t}
+        row = {"localDate": current.strftime("%Y-%m-%d")}
         for i, d in enumerate(lag_dates, 1):
             agg = processed_data.get(d)
             if agg is not None and not agg.empty:
@@ -177,8 +222,17 @@ def generate_lagged_features():
         df_row = pd.DataFrame([row])
         append_parquet_s3(df_row, BUCKET, LAGGED_KEY)
 
-        print(f"[{datetime.now().isoformat()}] Added lagged features for {t}")
-        t = (pd.to_datetime(t) + timedelta(days=1)).strftime("%Y-%m-%d")
+        logger.info(f"Added lagged features for {current}")
+        current = current + timedelta(days=1)
+
+
+def lambda_handler(event=None, context=None):
+    try:
+        generate_lagged_features(context)
+        return {"statusCode": 200, "body": "done"}
+    except Exception as e:
+        logger.exception("Error in preproc")
+        return {"statusCode": 500, "body": str(e)}
 
 
 # ---------- ENTRY POINT ----------
