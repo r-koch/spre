@@ -182,57 +182,53 @@ def find_start_date():
 
 def generate_lagged_features(context=None):
     """Main orchestration"""
-    
-    current = find_start_date()
-    now = datetime.now().date()
+    try:    
+        current = find_start_date()
+        now = datetime.now().date()
 
-    while current < now:
+        while current < now:
 
-        if context is not None and int(context.get_remaining_time_in_millis()) < MIN_REMAINING_MS:
-            logger.warning(f"Stopping early at {current} to avoid timeout (remaining_ms={context.get_remaining_time_in_millis()}).")
-            break
+            if context is not None and int(context.get_remaining_time_in_millis()) < MIN_REMAINING_MS:
+                logger.warning(f"Stopping early at {current} to avoid timeout (remaining_ms={context.get_remaining_time_in_millis()}).")
+                break
 
-        lag_dates = [
-            (current - timedelta(days=i)).strftime("%Y-%m-%d")
-            for i in range(1, LAG_DAYS + 1)
-        ]
+            lag_dates = [
+                (current - timedelta(days=i)).strftime("%Y-%m-%d")
+                for i in range(1, LAG_DAYS + 1)
+            ]
 
-        processed_data = {}
-        all_missing = True
-        for d in lag_dates:
-            agg = process_single_day(d)
-            if agg is not None and not agg.empty:
-                all_missing = False
-                processed_data[d] = agg
+            processed_data = {}
+            all_missing = True
+            for d in lag_dates:
+                agg = process_single_day(d)
+                if agg is not None and not agg.empty:
+                    all_missing = False
+                    processed_data[d] = agg
 
-        if all_missing:
-            logger.warning(f"Stopping at {current}: all {LAG_DAYS} previous raw days missing.")
-            break
+            if all_missing:
+                logger.warning(f"Stopping at {current}: all {LAG_DAYS} previous raw days missing.")
+                break
 
-        row = {"localDate": current.strftime("%Y-%m-%d")}
-        for i, d in enumerate(lag_dates, 1):
-            agg = processed_data.get(d)
-            if agg is not None and not agg.empty:
-                row[f"mean_sentiment-{i}"] = agg["mean_sentiment"].iloc[0]
-                row[f"count_articles-{i}"] = agg["count_articles"].iloc[0]
-            else:
-                row[f"mean_sentiment-{i}"] = float("nan")
-                row[f"count_articles-{i}"] = float("nan")
+            row = {"localDate": current.strftime("%Y-%m-%d")}
+            for i, d in enumerate(lag_dates, 1):
+                agg = processed_data.get(d)
+                if agg is not None and not agg.empty:
+                    row[f"mean_sentiment-{i}"] = agg["mean_sentiment"].iloc[0]
+                    row[f"count_articles-{i}"] = agg["count_articles"].iloc[0]
+                else:
+                    row[f"mean_sentiment-{i}"] = float("nan")
+                    row[f"count_articles-{i}"] = float("nan")
 
-        df_row = pd.DataFrame([row])
-        append_parquet_s3(df_row, BUCKET, LAGGED_KEY)
+            df_row = pd.DataFrame([row])
+            append_parquet_s3(df_row, BUCKET, LAGGED_KEY)
 
-        logger.info(f"Added lagged features for {current}")
-        current = current + timedelta(days=1)
+            logger.info(f"Added lagged features for {current}")
+            current = current + timedelta(days=1)
 
-
-def lambda_handler(event=None, context=None):
-    try:
-        generate_lagged_features(context)
         return {"statusCode": 200, "body": "done"}
     except Exception as e:
-        logger.exception("Error in preproc")
-        return {"statusCode": 500, "body": str(e)}
+        logger.exception("Error in generate_lagged_features")
+        return {"statusCode": 500, "body": "error"}
 
 
 # ---------- ENTRY POINT ----------

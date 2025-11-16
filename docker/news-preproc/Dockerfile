@@ -40,4 +40,4 @@ PY
 ENV MODEL_DIR=${LAMBDA_TASK_ROOT}/finbert_model
 
 # Set Lambda handler
-CMD ["preproc.lambda_handler"]
+CMD ["main.lambda_handler"]
