@@ -22,14 +22,22 @@ import software.amazon.awssdk.services.s3.S3Client;
 
 public class HistoricStockCollector {
 
+  private static final LocalDate AV_START_DATE = LocalDate.parse("1999-11-01");
+
   private static final String BUCKET_NAME = "dev-rkoch-spre";
 
+  private static final String LAST_PROCESSED_SYMBOL = "lastProcessedSymbol";
+
+  private static final LocalDate NASDAQ_START_DATE = LocalDate.parse("2015-10-02");
+
   private static final String PARQUET_KEY = "raw/stock/localDate=%s/data.parquet";
+
+  private static final String STATE_KEY = "metadata/historic_stock_collector_state.json";
 
   public static void main(String[] args) {
     HistoricStockCollector collector = new HistoricStockCollector();
     // collector.collect();
-    collector.store();
+    // collector.store();
   }
 
   private S3Client s3Client;
@@ -44,23 +52,21 @@ public class HistoricStockCollector {
   private void store() {
     List<StockRecord> stockRecords = read(Path.of(System.getProperty("user.dir"), "data.txt"));
     Map<LocalDate, Map<String, StockRecord>> map = toMap(stockRecords);
-    try (State state = new State(getS3Client(), BUCKET_NAME)) {
-      LocalDate date = state.getAvStartDate();
-      LocalDate endDate = state.getNasdaqStartDate();
-      for (; date.isBefore(endDate); date = date.plusDays(1)) {
-        Map<String, StockRecord> map2 = map.get(date);
-        if (map2 != null) {
-          List<StockRecord> records = new ArrayList<>();
-          Symbols symbols = new Symbols(getS3Parquet());
-          for (String symbol : symbols.get()) {
-            StockRecord stockRecord = map2.get(symbol);
-            if (stockRecord == null) {
-              stockRecord = StockRecord.of(date, symbol, 0, 0, 0, 0, 0);
-            }
-            records.add(stockRecord);
+    LocalDate date = AV_START_DATE;
+    LocalDate endDate = NASDAQ_START_DATE;
+    for (; date.isBefore(endDate); date = date.plusDays(1)) {
+      Map<String, StockRecord> map2 = map.get(date);
+      if (map2 != null) {
+        List<StockRecord> records = new ArrayList<>();
+        Symbols symbols = new Symbols(getS3Parquet());
+        for (String symbol : symbols.get()) {
+          StockRecord stockRecord = map2.get(symbol);
+          if (stockRecord == null) {
+            stockRecord = StockRecord.of(date, symbol, 0, 0, 0, 0, 0);
           }
-          insert(date, records);
+          records.add(stockRecord);
         }
+        insert(date, records);
       }
     }
   }
@@ -98,16 +104,16 @@ public class HistoricStockCollector {
 
   }
 
-  public void collect() {
-    try (State state = new State(getS3Client(), BUCKET_NAME)) {
+  private void collect() {
+    try (State state = new State(getS3Client(), BUCKET_NAME, STATE_KEY)) {
       Symbols symbols = new Symbols(getS3Parquet());
-      String lastSymbol = state.getLastProcessedStock();
+      String lastSymbol = state.get(LAST_PROCESSED_SYMBOL);
       for (String symbol : symbols.getAfter(lastSymbol)) {
         try {
           List<StockRecord> records = getAlphaVantageApi().getData(symbol);
           write(records);
           System.out.println("written %s".formatted(symbol));
-          state.setLastProcessedStock(symbol);
+          state.set(LAST_PROCESSED_SYMBOL, symbol);
         } catch (LimitExceededException e) {
           System.out.println("limit exceeded");
           return;
