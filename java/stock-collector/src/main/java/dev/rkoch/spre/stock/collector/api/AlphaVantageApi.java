@@ -4,7 +4,6 @@ import java.time.LocalDate;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import javax.naming.LimitExceededException;
 import com.crazzyghost.alphavantage.AlphaVantage;
 import com.crazzyghost.alphavantage.Config;
 import com.crazzyghost.alphavantage.parameters.OutputSize;
@@ -26,7 +25,7 @@ public class AlphaVantageApi {
     alphaVantage.init(Config.builder().key(System.getenv(ALPHAVANTAGE_API_KEY)).build());
   }
 
-  public StockRecord getData(final LocalDate date, final String symbol) throws LimitExceededException, NoDataForDateException {
+  public StockRecord getData(final LocalDate date, final String symbol) throws NoDataForDateException {
     for (StockUnit stockUnit : getStockUnits(symbol)) {
       if (LocalDate.parse(stockUnit.getDate()).isEqual(date)) {
         return StockRecord.of(symbol, stockUnit);
@@ -35,18 +34,18 @@ public class AlphaVantageApi {
     throw new NoDataForDateException("no data found for %s on %s".formatted(symbol, date));
   }
 
-  public List<StockRecord> getData(final String symbol) throws LimitExceededException {
+  public List<StockRecord> getData(final String symbol) {
     return getStockUnits(symbol).stream().map((stockUnit) -> StockRecord.of(symbol, stockUnit)).toList();
   }
 
-  private List<StockUnit> getStockUnits(final String symbol) throws LimitExceededException {
+  private List<StockUnit> getStockUnits(final String symbol) {
     List<StockUnit> stockUnits = cache.get(symbol);
     if (stockUnits == null) {
       String apiSymbol = symbol.replace(".", "-");
-      TimeSeriesResponse response = alphaVantage.timeSeries().daily().forSymbol(apiSymbol).outputSize(OutputSize.FULL).fetchSync();
+      TimeSeriesResponse response = alphaVantage.timeSeries().daily().forSymbol(apiSymbol).outputSize(OutputSize.COMPACT).fetchSync();
       String errorMessage = response.getErrorMessage();
       if (errorMessage != null && !errorMessage.isBlank()) {
-        throw new LimitExceededException("alphavantage limit exceeded for %s".formatted(LocalDate.now()));
+        throw new RuntimeException(errorMessage);
       }
       stockUnits = response.getStockUnits();
       cache.put(symbol, stockUnits);

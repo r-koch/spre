@@ -3,7 +3,6 @@ package dev.rkoch.spre.stock.collector;
 import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.List;
-import javax.naming.LimitExceededException;
 import com.amazonaws.services.lambda.runtime.Context;
 import com.amazonaws.services.lambda.runtime.LambdaLogger;
 import com.amazonaws.services.lambda.runtime.logging.LogLevel;
@@ -65,11 +64,8 @@ public class StockCollector {
         state.setDate(LAST_ADDED, date);
       } catch (NoDataForDateException e) {
         continue;
-      } catch (LimitExceededException e) {
-        logger.log(e.getMessage(), LogLevel.ERROR);
-        return;
-      } catch (Exception e) {
-        logger.log(e.getMessage(), LogLevel.ERROR);
+      } catch (Throwable t) {
+        logger.log(t.getMessage(), LogLevel.ERROR);
         return;
       }
     }
@@ -86,7 +82,7 @@ public class StockCollector {
     return alphaVantageApi;
   }
 
-  private List<StockRecord> getData(final LocalDate date) throws LimitExceededException, NoDataForDateException {
+  private List<StockRecord> getData(final LocalDate date) throws NoDataForDateException {
     List<StockRecord> records = new ArrayList<>();
     boolean isTradingDay = false;
     for (String symbol : getSymbols()) {

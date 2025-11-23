@@ -10,7 +10,6 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import javax.naming.LimitExceededException;
 import dev.rkoch.spre.collector.utils.State;
 import dev.rkoch.spre.s3.parquet.S3Parquet;
 import dev.rkoch.spre.stock.collector.StockRecord;
@@ -114,8 +113,9 @@ public class HistoricStockCollector {
           write(records);
           System.out.println("written %s".formatted(symbol));
           state.set(LAST_PROCESSED_SYMBOL, symbol);
-        } catch (LimitExceededException e) {
-          System.out.println("limit exceeded");
+        } catch (Exception e) {
+          System.out.println(e.getMessage());
+          System.out.println("limit exceeded?");
           return;
         }
       }

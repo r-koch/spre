@@ -8,7 +8,6 @@
 		<version>0.0.1-SNAPSHOT</version>
 	</parent>
 	<artifactId>stock-collector</artifactId>
-	
 	<dependencies>
 		<dependency>
 			<groupId>dev.rkoch.spre</groupId>
