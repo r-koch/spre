@@ -8,9 +8,7 @@ import java.net.http.HttpResponse;
 import java.net.http.HttpResponse.BodyHandlers;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
-import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 import org.json.JSONArray;
 import org.json.JSONException;
@@ -23,13 +21,14 @@ public class NasdaqApi {
 
   // https://api.nasdaq.com/api/quote/tsla/historical?assetclass=stocks&fromdate=2025-08-07&limit=1&todate=2025-08-08
   // https://api.nasdaq.com/api/quote/tsla/historical?assetclass=stocks&limit=10000&fromdate=1999-11-01&todate=2025-09-07
-  private static final String API_URL = "https://api.nasdaq.com/api/quote/%s/historical?assetclass=stocks&limit=10000&fromdate=%s&todate=%s";
+  // https://api.nasdaq.com/api/quote/bf%25sl%25b/historical?assetclass=stocks&fromdate=2015-11-23&limit=9999&todate=2025-11-23
+  private static final String API_URL = "https://api.nasdaq.com/api/quote/%s/historical?assetclass=stocks&fromdate=%s&limit=9999&todate=%s";
 
   private static final DateTimeFormatter MM_DD_YYYY = DateTimeFormatter.ofPattern("MM/dd/uuuu");
 
   private static final LocalDate DEFAULT_FROM_DATE = LocalDate.of(1999, 11, 1);
 
-  private final Map<String, List<StockRecord>> cache = new HashMap<>();
+  private final Map<String, Map<LocalDate, StockRecord>> cache = new HashMap<>();
 
   private final HttpClient httpClient;
 
@@ -51,57 +50,81 @@ public class NasdaqApi {
   }
 
   public StockRecord getData(final LocalDate date, final String symbol) throws NoDataForDateException, SymbolNotExistsException {
-    try {
-      List<StockRecord> records = cache.get(symbol);
-      if (records == null) {
-        HttpRequest httpRequest = HttpRequest.newBuilder(getUri(symbol)).build();
-        HttpResponse<String> httpResponse = httpClient.send(httpRequest, BodyHandlers.ofString());
-        String body = httpResponse.body();
-        JSONObject json = new JSONObject(body);
-        try {
-          JSONObject status = json.getJSONObject("status");
-          if (status.getInt("rCode") == 200) {
-            JSONObject data = json.getJSONObject("data");
-            if (data.getInt("totalRecords") > 0) {
-              JSONArray rows = data.getJSONObject("tradesTable").getJSONArray("rows");
-              records = new ArrayList<>();
-              for (int i = 0; i < rows.length(); i++) {
-                JSONObject row = rows.getJSONObject(i);
-                LocalDate rowDate = LocalDate.parse(row.getString("date"), MM_DD_YYYY);
-                String close = cleanNumber(row.getString("close"));
-                String high = cleanNumber(row.getString("high"));
-                String low = cleanNumber(row.getString("low"));
-                String open = cleanNumber(row.getString("open"));
-                String volume = cleanNumber(row.getString("volume"));
-                records.add(StockRecord.of(rowDate, symbol, close, high, low, open, volume));
-              }
-              cache.put(symbol, records);
-            } else {
-              throw new NoDataForDateException(fromDate);
-            }
-          } else {
-            if (status.getJSONArray("bCodeMessage").getJSONObject(0).getInt("code") == 1001) {
-              throw new SymbolNotExistsException();
-            }
-          }
-        } catch (JSONException e) {
-          throw new RuntimeException(json.toString(), e);
-        }
-      }
-      for (StockRecord stockRecord : cache.get(symbol).reversed()) {
-        if (stockRecord.getLocalDate().isEqual(date)) {
-          return stockRecord;
-        }
-      }
+    StockRecord stockRecord = getRecords(symbol).get(date);
+    if (stockRecord != null) {
+      return stockRecord;
+    } else {
       throw new NoDataForDateException(date);
+    }
+  }
+
+  private String getJsonString(final String symbol) {
+    try {
+      HttpRequest httpRequest = HttpRequest.newBuilder(getUri(symbol)).build();
+      HttpResponse<String> httpResponse = httpClient.send(httpRequest, BodyHandlers.ofString());
+      return httpResponse.body();
     } catch (IOException | InterruptedException e) {
       throw new RuntimeException(e);
     }
   }
 
+  private Map<LocalDate, StockRecord> getRecords(final String symbol) throws NoDataForDateException, SymbolNotExistsException {
+    Map<LocalDate, StockRecord> records = cache.get(symbol);
+    if (records == null) {
+      records = getRecordsFromApi(symbol);
+      cache.put(symbol, records);
+    }
+    return records;
+  }
+
+  private Map<LocalDate, StockRecord> getRecordsFromApi(final String symbol) throws NoDataForDateException, SymbolNotExistsException {
+    String source = getJsonString(symbol);
+    JSONArray rows = getRows(source);
+    Map<LocalDate, StockRecord> records = new HashMap<>(rows.length());
+    for (int i = 0; i < rows.length(); i++) {
+      JSONObject row = rows.getJSONObject(i);
+      StockRecord record = rowToStockRecord(symbol, row);
+      records.put(record.getLocalDate(), record);
+    }
+    return records;
+  }
+
+  private JSONArray getRows(final String source) throws NoDataForDateException, SymbolNotExistsException {
+    try {
+      JSONObject json = new JSONObject(source);
+      JSONObject status = json.getJSONObject("status");
+      if (status.getInt("rCode") == 200) {
+        JSONObject data = json.getJSONObject("data");
+        if (data.getInt("totalRecords") > 0) {
+          return data.getJSONObject("tradesTable").getJSONArray("rows");
+        } else {
+          throw new NoDataForDateException(fromDate);
+        }
+      } else {
+        if (status.getJSONArray("bCodeMessage").getJSONObject(0).getInt("code") == 1001) {
+          throw new SymbolNotExistsException();
+        } else {
+          throw new RuntimeException(source);
+        }
+      }
+    } catch (JSONException e) {
+      throw new RuntimeException(source);
+    }
+  }
+
   private URI getUri(final String symbol) {
-    String apiSymbol = symbol.replace(".", "-");
+    String apiSymbol = symbol.replace(".", "%25sl%25"); // for symbols like bf.b the "." needs to be replaced with "%sl%" and "%" url encoded to "%25"
     return URI.create(API_URL.formatted(apiSymbol, fromDate, toDate));
+  }
+
+  private StockRecord rowToStockRecord(final String symbol, final JSONObject row) {
+    LocalDate rowDate = LocalDate.parse(row.getString("date"), MM_DD_YYYY);
+    String close = cleanNumber(row.getString("close"));
+    String high = cleanNumber(row.getString("high"));
+    String low = cleanNumber(row.getString("low"));
+    String open = cleanNumber(row.getString("open"));
+    String volume = cleanNumber(row.getString("volume"));
+    return StockRecord.of(rowDate, symbol, close, high, low, open, volume);
   }
 
 }

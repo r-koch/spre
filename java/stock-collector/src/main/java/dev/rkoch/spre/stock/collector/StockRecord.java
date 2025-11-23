@@ -5,7 +5,6 @@ import org.apache.parquet.schema.LogicalTypeAnnotation;
 import org.apache.parquet.schema.MessageType;
 import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName;
 import org.apache.parquet.schema.Types;
-import com.crazzyghost.alphavantage.timeseries.response.StockUnit;
 import blue.strategic.parquet.Dehydrator;
 import blue.strategic.parquet.Hydrator;
 import dev.rkoch.spre.s3.parquet.ParquetRecord;
@@ -33,11 +32,6 @@ public class StockRecord implements ParquetRecord<StockRecord> {
     double o = Double.parseDouble(open);
     long v = parseLong(volume);
     return new StockRecord(localDate, id, c, h, l, o, v);
-  }
-
-  public static StockRecord of(final String id, final StockUnit stockUnit) {
-    return new StockRecord(LocalDate.parse(stockUnit.getDate()), id, stockUnit.getClose(), stockUnit.getHigh(), stockUnit.getLow(), stockUnit.getOpen(),
-        stockUnit.getVolume());
   }
 
   private static long parseLong(final String value) {

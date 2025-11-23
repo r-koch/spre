@@ -56,11 +56,6 @@
 				<version>1.3.0</version>
 			</dependency>
 			<dependency>
-				<groupId>com.github.crazzyghost</groupId>
-				<artifactId>alphavantage-java</artifactId>
-				<version>1.8.0</version>
-			</dependency>
-			<dependency>
 				<groupId>org.apache.iceberg</groupId>
 				<artifactId>iceberg-aws</artifactId>
 				<version>1.10.0</version>

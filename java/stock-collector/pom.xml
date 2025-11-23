@@ -26,10 +26,6 @@
 			<groupId>org.slf4j</groupId>
 			<artifactId>slf4j-nop</artifactId>
 		</dependency>
-		<dependency>
-			<groupId>com.github.crazzyghost</groupId>
-			<artifactId>alphavantage-java</artifactId>
-		</dependency>
 	</dependencies>
 	<build>
 		<plugins>

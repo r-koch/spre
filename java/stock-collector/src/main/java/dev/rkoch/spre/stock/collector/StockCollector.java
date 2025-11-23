@@ -8,7 +8,6 @@ import com.amazonaws.services.lambda.runtime.LambdaLogger;
 import com.amazonaws.services.lambda.runtime.logging.LogLevel;
 import dev.rkoch.spre.collector.utils.Environment;
 import dev.rkoch.spre.collector.utils.State;
-import dev.rkoch.spre.stock.collector.api.AlphaVantageApi;
 import dev.rkoch.spre.stock.collector.api.NasdaqApi;
 import dev.rkoch.spre.stock.collector.exception.NoDataForDateException;
 import dev.rkoch.spre.stock.collector.exception.SymbolNotExistsException;
@@ -30,8 +29,6 @@ public class StockCollector {
   private final Handler handler;
 
   private final LambdaLogger logger;
-
-  private AlphaVantageApi alphaVantageApi;
 
   private NasdaqApi nasdaqApi;
 
@@ -75,34 +72,22 @@ public class StockCollector {
     return context.getRemainingTimeInMillis() >= MIN_REMAINING_TIME_MILLIS;
   }
 
-  private AlphaVantageApi getAlphaVantageApi() {
-    if (alphaVantageApi == null) {
-      alphaVantageApi = new AlphaVantageApi();
-    }
-    return alphaVantageApi;
-  }
-
-  private List<StockRecord> getData(final LocalDate date) throws NoDataForDateException {
+  private List<StockRecord> getData(final LocalDate date) throws NoDataForDateException, SymbolNotExistsException {
     List<StockRecord> records = new ArrayList<>();
-    boolean isTradingDay = false;
+    boolean dataFoundForDate = false;
     for (String symbol : getSymbols()) {
       try {
+        records.add(getNasdaqApi(date).getData(date, symbol));
+        dataFoundForDate = true;
         try {
-          records.add(getNasdaqApi(date).getData(date, symbol));
-          isTradingDay = true;
-          try {
-            Thread.sleep(11L);
-          } catch (InterruptedException e) {
-            logger.log(e.getMessage(), LogLevel.ERROR);
-          }
-        } catch (SymbolNotExistsException e) {
-          records.add(getAlphaVantageApi().getData(date, symbol));
-          isTradingDay = true;
+          Thread.sleep(11L);
+        } catch (InterruptedException e) {
+          logger.log(e.getMessage(), LogLevel.ERROR);
         }
       } catch (NoDataForDateException e) {
         records.add(StockRecord.of(date, symbol, 0, 0, 0, 0, 0));
       }
-      if (!isTradingDay) {
+      if (!dataFoundForDate) {
         throw new NoDataForDateException();
       }
       logger.log("%s collected %s".formatted(date, symbol), LogLevel.TRACE);
