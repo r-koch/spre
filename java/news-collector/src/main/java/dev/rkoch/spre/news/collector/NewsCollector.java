@@ -26,7 +26,7 @@ public class NewsCollector {
   private static final String API_URL =
       "https://content.guardianapis.com/search?api-key=%s&show-fields=bodyText&lang=en&page-size=50&from-date=%s&to-date=%s&page=%s";
 
-  private static final long API_CALL_MIN_FREQUENCY_MILLIS = Environment.get("API_CALL_MIN_FREQUENCY_MILLIS", 1010);
+  private static final long API_CALL_MIN_FREQUENCY_MILLIS = Environment.get("API_CALL_MIN_FREQUENCY_MILLIS", 1_010);
 
   private static final LocalDate AV_START_DATE = LocalDate.parse(Environment.get("AV_START_DATE", "1999-11-01"));
 
@@ -41,6 +41,8 @@ public class NewsCollector {
   private static final String PILLAR_ID = "pillar/news";
 
   private static final String STATE_KEY = Environment.get("STATE_KEY", "metadata/news_collector_state.json");
+
+  private static final String THEGUARDIAN_API_KEY = Environment.get("THEGUARDIAN_API_KEY");
 
   private final Context context;
 
@@ -144,7 +146,7 @@ public class NewsCollector {
   }
 
   private URI getUri(final LocalDate from, final LocalDate to, final int page) {
-    return URI.create(API_URL.formatted(handler.getApiKey(), from.toString(), to.toString(), page));
+    return URI.create(API_URL.formatted(THEGUARDIAN_API_KEY, from.toString(), to.toString(), page));
   }
 
   private void insert(final LocalDate date, final List<NewsRecord> records) throws Exception {

@@ -4,6 +4,7 @@ import java.net.http.HttpClient;
 import com.amazonaws.services.lambda.runtime.Context;
 import com.amazonaws.services.lambda.runtime.RequestHandler;
 import com.amazonaws.services.lambda.runtime.logging.LogLevel;
+import dev.rkoch.spre.collector.utils.Environment;
 import dev.rkoch.spre.s3.parquet.S3Parquet;
 import software.amazon.awssdk.http.urlconnection.UrlConnectionHttpClient;
 import software.amazon.awssdk.regions.Region;
@@ -11,24 +12,13 @@ import software.amazon.awssdk.services.s3.S3Client;
 
 public class Handler implements RequestHandler<Void, Void> {
 
-  private static final String ENV_AWS_REGION = "AWS_REGION";
-
-  private static final String ENV_THEGUARDIAN_API_KEY = "THEGUARDIAN_API_KEY";
-
-  private String apiKey;
+  private static final String AWS_REGION = Environment.get("AWS_REGION", "eu-west-1");
 
   private HttpClient httpClient;
 
   private S3Client s3Client;
 
   private S3Parquet s3Parquet;
-
-  String getApiKey() {
-    if (apiKey == null) {
-      apiKey = System.getenv(ENV_THEGUARDIAN_API_KEY);
-    }
-    return apiKey;
-  }
 
   HttpClient getHttpClient() {
     if (httpClient == null) {
@@ -39,7 +29,7 @@ public class Handler implements RequestHandler<Void, Void> {
 
   S3Client getS3Client() {
     if (s3Client == null) {
-      s3Client = S3Client.builder().region(Region.of(System.getenv(ENV_AWS_REGION))).httpClientBuilder(UrlConnectionHttpClient.builder()).build();
+      s3Client = S3Client.builder().region(Region.of(AWS_REGION)).httpClientBuilder(UrlConnectionHttpClient.builder()).build();
     }
     return s3Client;
   }
