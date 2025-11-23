@@ -10,9 +10,11 @@ import dev.rkoch.spre.collector.utils.Environment;
 import dev.rkoch.spre.collector.utils.State;
 import dev.rkoch.spre.stock.collector.api.NasdaqApi;
 import dev.rkoch.spre.stock.collector.exception.NoDataForDateException;
-import dev.rkoch.spre.stock.collector.exception.SymbolNotExistsException;
+import dev.rkoch.spre.stock.collector.exception.SymbolNotFoundException;
 
 public class StockCollector {
+
+  private static final long API_REQUEST_PAUSE_MILLIS = Environment.get("API_REQUEST_PAUSE_MILLIS", 11);
 
   private static final String BUCKET_NAME = Environment.get("BUCKET_NAME", "dev-rkoch-spre");
 
@@ -57,9 +59,10 @@ public class StockCollector {
         } else {
           insert(date, records);
           logger.log("%s inserted".formatted(date), LogLevel.INFO);
+          state.setDate(LAST_ADDED, date);
         }
-        state.setDate(LAST_ADDED, date);
       } catch (NoDataForDateException e) {
+        logger.log("%s no data".formatted(date), LogLevel.INFO);
         continue;
       } catch (Throwable t) {
         logger.log(t.getMessage(), LogLevel.ERROR);
@@ -72,15 +75,16 @@ public class StockCollector {
     return context.getRemainingTimeInMillis() >= MIN_REMAINING_TIME_MILLIS;
   }
 
-  private List<StockRecord> getData(final LocalDate date) throws NoDataForDateException, SymbolNotExistsException {
+  private List<StockRecord> getData(final LocalDate date) throws NoDataForDateException, SymbolNotFoundException {
     List<StockRecord> records = new ArrayList<>();
     boolean dataFoundForDate = false;
-    for (String symbol : getSymbols()) {
+    List<String> symbols = getSymbols();
+    for (String symbol : symbols) {
       try {
         records.add(getNasdaqApi(date).getData(date, symbol));
         dataFoundForDate = true;
         try {
-          Thread.sleep(11L);
+          Thread.sleep(API_REQUEST_PAUSE_MILLIS);
         } catch (InterruptedException e) {
           logger.log(e.getMessage(), LogLevel.ERROR);
         }

@@ -15,7 +15,7 @@ import org.json.JSONException;
 import org.json.JSONObject;
 import dev.rkoch.spre.stock.collector.StockRecord;
 import dev.rkoch.spre.stock.collector.exception.NoDataForDateException;
-import dev.rkoch.spre.stock.collector.exception.SymbolNotExistsException;
+import dev.rkoch.spre.stock.collector.exception.SymbolNotFoundException;
 
 public class NasdaqApi {
 
@@ -49,7 +49,18 @@ public class NasdaqApi {
     return number.replace("$", "").replace(",", "");
   }
 
-  public StockRecord getData(final LocalDate date, final String symbol) throws NoDataForDateException, SymbolNotExistsException {
+  private String getApiSymbol(final String symbol) {
+    if ("fi".equalsIgnoreCase(symbol)) {
+      // from 2025-11-21 fi -> fisv
+      // api gets data with new symbol for old dates
+      return "fisv";
+    } else {
+      // for symbols like bf.b the "." needs to be replaced with "%sl%" and "%" url encoded to "%25"
+      return symbol.replace(".", "%25sl%25");
+    }
+  }
+
+  public StockRecord getData(final LocalDate date, final String symbol) throws NoDataForDateException, SymbolNotFoundException {
     StockRecord stockRecord = getRecords(symbol).get(date);
     if (stockRecord != null) {
       return stockRecord;
@@ -60,7 +71,9 @@ public class NasdaqApi {
 
   private String getJsonString(final String symbol) {
     try {
-      HttpRequest httpRequest = HttpRequest.newBuilder(getUri(symbol)).build();
+      String apiSymbol = getApiSymbol(symbol);
+      URI uri = getUri(apiSymbol);
+      HttpRequest httpRequest = HttpRequest.newBuilder(uri).build();
       HttpResponse<String> httpResponse = httpClient.send(httpRequest, BodyHandlers.ofString());
       return httpResponse.body();
     } catch (IOException | InterruptedException e) {
@@ -68,7 +81,7 @@ public class NasdaqApi {
     }
   }
 
-  private Map<LocalDate, StockRecord> getRecords(final String symbol) throws NoDataForDateException, SymbolNotExistsException {
+  private Map<LocalDate, StockRecord> getRecords(final String symbol) throws NoDataForDateException, SymbolNotFoundException {
     Map<LocalDate, StockRecord> records = cache.get(symbol);
     if (records == null) {
       records = getRecordsFromApi(symbol);
@@ -77,19 +90,24 @@ public class NasdaqApi {
     return records;
   }
 
-  private Map<LocalDate, StockRecord> getRecordsFromApi(final String symbol) throws NoDataForDateException, SymbolNotExistsException {
+  private Map<LocalDate, StockRecord> getRecordsFromApi(final String symbol) throws NoDataForDateException, SymbolNotFoundException {
     String source = getJsonString(symbol);
-    JSONArray rows = getRows(source);
-    Map<LocalDate, StockRecord> records = new HashMap<>(rows.length());
-    for (int i = 0; i < rows.length(); i++) {
-      JSONObject row = rows.getJSONObject(i);
-      StockRecord record = rowToStockRecord(symbol, row);
-      records.put(record.getLocalDate(), record);
+    try {
+      JSONArray rows = getRows(source);
+      Map<LocalDate, StockRecord> records = new HashMap<>(rows.length());
+      for (int i = 0; i < rows.length(); i++) {
+        JSONObject row = rows.getJSONObject(i);
+        StockRecord record = rowToStockRecord(symbol, row);
+        records.put(record.getLocalDate(), record);
+      }
+      return records;
+    } catch (SymbolNotFoundException e) {
+      e.setSymbol(symbol);
+      throw e;
     }
-    return records;
   }
 
-  private JSONArray getRows(final String source) throws NoDataForDateException, SymbolNotExistsException {
+  private JSONArray getRows(final String source) throws NoDataForDateException, SymbolNotFoundException {
     try {
       JSONObject json = new JSONObject(source);
       JSONObject status = json.getJSONObject("status");
@@ -102,7 +120,7 @@ public class NasdaqApi {
         }
       } else {
         if (status.getJSONArray("bCodeMessage").getJSONObject(0).getInt("code") == 1001) {
-          throw new SymbolNotExistsException();
+          throw new SymbolNotFoundException();
         } else {
           throw new RuntimeException(source);
         }
@@ -112,8 +130,7 @@ public class NasdaqApi {
     }
   }
 
-  private URI getUri(final String symbol) {
-    String apiSymbol = symbol.replace(".", "%25sl%25"); // for symbols like bf.b the "." needs to be replaced with "%sl%" and "%" url encoded to "%25"
+  private URI getUri(final String apiSymbol) {
     return URI.create(API_URL.formatted(apiSymbol, fromDate, toDate));
   }
 

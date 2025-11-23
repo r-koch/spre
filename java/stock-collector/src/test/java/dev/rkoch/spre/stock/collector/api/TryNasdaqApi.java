@@ -6,8 +6,9 @@ import dev.rkoch.spre.stock.collector.StockRecord;
 public class TryNasdaqApi {
 
   public static void main(String[] args) throws Exception {
-    tryGetData("bf.b");
-    tryGetData("brk.b");
+    // tryGetData("bf.b");
+    // tryGetData("brk.b");
+    tryGetData("fi");
   }
 
   public static void tryGetData(final String symbol) throws Exception {

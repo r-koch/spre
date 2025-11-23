@@ -3,6 +3,7 @@ package dev.rkoch.spre.stock.collector;
 import java.net.http.HttpClient;
 import com.amazonaws.services.lambda.runtime.Context;
 import com.amazonaws.services.lambda.runtime.RequestHandler;
+import dev.rkoch.spre.collector.utils.Environment;
 import dev.rkoch.spre.s3.parquet.S3Parquet;
 import software.amazon.awssdk.http.urlconnection.UrlConnectionHttpClient;
 import software.amazon.awssdk.regions.Region;
@@ -10,7 +11,7 @@ import software.amazon.awssdk.services.s3.S3Client;
 
 public class Handler implements RequestHandler<Void, Void> {
 
-  private static final String ENV_AWS_REGION = "AWS_REGION";
+  private static final String AWS_REGION = Environment.get("AWS_REGION", "eu-west-1");
 
   private HttpClient httpClient;
 
@@ -27,7 +28,7 @@ public class Handler implements RequestHandler<Void, Void> {
 
   S3Client getS3Client() {
     if (s3Client == null) {
-      s3Client = S3Client.builder().region(Region.of(System.getenv(ENV_AWS_REGION))).httpClientBuilder(UrlConnectionHttpClient.builder()).build();
+      s3Client = S3Client.builder().region(Region.of(AWS_REGION)).httpClientBuilder(UrlConnectionHttpClient.builder()).build();
     }
     return s3Client;
   }
