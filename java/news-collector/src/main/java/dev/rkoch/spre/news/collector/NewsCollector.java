@@ -76,10 +76,10 @@ public class NewsCollector {
         }
         state.setDate(LAST_ADDED, date);
       } catch (LimitExceededException e) {
-        logger.log("theguardian limit exceeded".formatted(date), LogLevel.INFO);
+        logger.log("%s theguardian limit exceeded? %s".formatted(date, e.getMessage()), LogLevel.INFO);
         return;
-      } catch (Exception e) {
-        logger.log(e.getMessage(), LogLevel.ERROR);
+      } catch (Throwable t) {
+        logger.log(t.getMessage(), LogLevel.ERROR);
         return;
       }
     }
@@ -100,7 +100,7 @@ public class NewsCollector {
       }
       return items;
     } catch (JSONException e) {
-      throw new LimitExceededException();
+      throw new LimitExceededException(e.getMessage());
     }
   }
 
