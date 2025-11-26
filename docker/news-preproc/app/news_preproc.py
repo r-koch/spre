@@ -7,6 +7,7 @@ import unicodedata
 from io import BytesIO
 from datetime import date, datetime, timedelta, timezone
 import boto3
+import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 import pyarrow as pa
@@ -67,14 +68,21 @@ logger = setup_logger()
 tokenizer = None
 model = None
 
+def is_docker():
+    return "MODEL_DIR" in os.environ
+
+def get_tokenizer():
+    global tokenizer
+    if tokenizer is None:
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME_OR_DIR, local_files_only=is_docker())
+    return tokenizer
+
 def get_model():
-    global tokenizer, model
-    if tokenizer is None or model is None:
-        is_docker = "MODEL_DIR" in os.environ
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME_OR_DIR, local_files_only=is_docker)
-        model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME_OR_DIR, local_files_only=is_docker)
+    global model
+    if model is None:
+        model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME_OR_DIR, local_files_only=is_docker())
         model.eval()
-    return tokenizer, model
+    return model
 
 
 # ---------- HELPERS ----------
@@ -128,13 +136,11 @@ def clean_text(text: str) -> str:
 
 
 @torch.no_grad()
-def analyze_sentiment(texts):
-    if not texts:
-        return []
-    tokenizer, model = get_model()
-    encodings = tokenizer(texts, padding=True, truncation=True, max_length=128, return_tensors="pt")
+def analyze_sentiment(encodings):
+    model = get_model()
     outputs = model(**encodings)
     probs = torch.nn.functional.softmax(outputs.logits, dim=-1)
+
     labels = probs.argmax(dim=-1).tolist()
     scores = []
     for i, label in enumerate(labels):
@@ -145,16 +151,15 @@ def analyze_sentiment(texts):
         else:
             score = 0.0
         scores.append(score)
+
     return scores
 
 
 def detect_available_memory_mb() -> int:
-    # 1. Prefer AWS Lambda declared memory
     mem_env = os.environ.get("AWS_LAMBDA_FUNCTION_MEMORY_SIZE")
     if mem_env:
         return int(mem_env)
 
-    # 2. Fallback to /proc/meminfo
     try:
         with open("/proc/meminfo") as f:
             for line in f:
@@ -165,7 +170,6 @@ def detect_available_memory_mb() -> int:
     except Exception:
         pass
 
-    # 3. Default fallback
     return 1024
 
 def choose_batch_size():
@@ -182,7 +186,24 @@ def choose_batch_size():
     else:
         return 8
 
-# ---------- PIPELINE ----------
+def fast_skew(x):
+    arr = np.asarray(x, dtype=np.float64)
+    m = arr.mean()
+    s = arr.std()
+    if s == 0:
+        return 0.0
+    n = len(arr)
+    return np.sum(((arr - m) / s) ** 3) * (n / ((n - 1) * (n - 2)))
+
+def fast_kurtosis(x):
+    arr = np.asarray(x, dtype=np.float64)
+    m = arr.mean()
+    s = arr.std()
+    if s == 0:
+        return 0.0
+    n = len(arr)
+    return np.sum(((arr - m) / s) ** 4) * (n / ((n - 1) * (n - 2))) - 3
+
 def get_sentiment(local_date: date):
     date_str = local_date.strftime("%Y-%m-%d")
     raw_key = f"{RAW_PREFIX}{date_str}/data.parquet"
@@ -200,12 +221,14 @@ def get_sentiment(local_date: date):
         df = read_parquet_s3(BUCKET, raw_key)
     except s3.exceptions.ClientError as e:
         if e.response['Error']['Code'] == "NoSuchKey":
-            raise ValueError(f"Raw parquet {raw_key} is missing")
+            # IMPORTANT: If raw parquet is missing or empty, DO NOT create sentiment/aggregated files.
+            # This preserves the signal that raw data itself is missing and prevents silent imputation.
+            return None
         else:
             raise
 
     if df.empty:
-        raise ValueError(f"Raw parquet {raw_key} is unexpectedly empty")
+        return None
 
     df["title_clean"] = df["title"].map(clean_text)
     df["body_clean"] = df["body"].map(clean_text)
@@ -213,17 +236,28 @@ def get_sentiment(local_date: date):
 
     # Sentiment
     batch_size = choose_batch_size()
-    text_scores = []
-    title_scores = []
+    tokenizer = get_tokenizer()
+    sentiment_scores = []
+    headline_sentiment_scores = []
     for i in range(0, len(df), batch_size):
-        text_batch = df["text_clean"].iloc[i : i + batch_size].tolist()
-        text_scores.extend(analyze_sentiment(text_batch))
-
+        text_batch  = df["text_clean"].iloc[i : i + batch_size].tolist()
         title_batch = df["title_clean"].iloc[i : i + batch_size].tolist()
-        title_scores.extend(analyze_sentiment(title_batch))
 
-    df["sentiment_score"] = text_scores
-    df["headline_only_sentiment"] = title_scores
+        enc_text  = tokenizer(text_batch,  padding=True, truncation=True, max_length=256, return_tensors="pt")
+        enc_title = tokenizer(title_batch, padding=True, truncation=True, max_length=32, return_tensors="pt")
+
+        combined = {}
+        for key in enc_text:
+            combined[key] = torch.cat([enc_text[key], enc_title[key]], dim=0)
+
+        combined_scores = analyze_sentiment(combined)
+
+        half = len(combined_scores) // 2
+        sentiment_scores.extend(combined_scores[:half])
+        headline_sentiment_scores.extend(combined_scores[half:])
+
+    df["sentiment_score"] = sentiment_scores
+    df["headline_sentiment_score"] = headline_sentiment_scores
 
     # Additional fields needed for some aggregates
     df["is_positive"] = df["sentiment_score"] > 0
@@ -249,6 +283,8 @@ def get_aggregated(local_date: date):
             raise
 
     df = get_sentiment(local_date)
+    if df is None:
+        return None
 
     result = pd.DataFrame({
         "localDate": [date_str],
@@ -263,12 +299,13 @@ def get_aggregated(local_date: date):
             (df["text_length"].sum() + 1e-9)
         ],
         "extreme_sentiment_share": [df["is_extreme"].mean()],
-        "sentiment_skewness": [df["sentiment_score"].skew()],
-        "sentiment_kurtosis": [df["sentiment_score"].kurtosis()],
+        "sentiment_skewness": [fast_skew(df["sentiment_score"].values)],
+        "sentiment_kurtosis": [fast_kurtosis(df["sentiment_score"].values)],
         "neutral_share": [df["is_neutral"].mean()],
         "max_sentiment": [df["sentiment_score"].max()],
         "min_sentiment": [df["sentiment_score"].min()],
-        "headline_only_mean_sentiment": [df["headline_only_sentiment"].mean()],
+        "headline_mean_sentiment": [df["headline_sentiment_score"].mean()],
+        "headline_median_sentiment": [df["headline_sentiment_score"].median()],
         "article_length_variance": [df["text_length"].var()],
         "ratio_pos_neg": [
             (df["is_positive"].mean()) /
@@ -309,8 +346,8 @@ def generate_lagged_features(context=None):
             "neutral_share",
             "max_sentiment",
             "min_sentiment",
-            "headline_only_mean_sentiment",
-            "ewma_time_weighted_sentiment",
+            "headline_mean_sentiment",
+            "headline_median_sentiment",
             "article_length_variance",
             "ratio_pos_neg",
             "conflict_share",
