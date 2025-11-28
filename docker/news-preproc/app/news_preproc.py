@@ -4,6 +4,9 @@ import logging
 import os
 import re
 import unicodedata
+import time
+import random
+from botocore.exceptions import ClientError
 from io import BytesIO
 from datetime import date, datetime, timedelta, timezone
 import boto3
@@ -21,6 +24,8 @@ LAG_DAYS = int(os.environ.get("LAG_DAYS", "5"))
 START_DATE = os.environ.get("START_DATE", "1999-10-27")
 MIN_REMAINING_MS = int(os.environ.get("MIN_REMAINING_MS", "60000"))
 MODEL_NAME_OR_DIR = os.environ.get("MODEL_DIR", "ProsusAI/finbert")  # locally use model name, in docker use env
+RETRY_COUNT = int(os.environ.get("RETRY_COUNT", "3"))
+RETRY_DELAY = float(os.environ.get("RETRY_DELAY", "0.25"))
 
 LAST_PROCESSED_KEY = "lastProcessed"
 LAST_ADDED_KEY = "lastAdded"
@@ -34,14 +39,12 @@ COLLECTOR_STATE_KEY = f"{META_DATA}news_collector_state.json"
 PREPROC_STATE_KEY = f"{META_DATA}news_preproc_state.json"
 LAGGED_OUTPUT_PREFIX = f"news/lagged-{LAG_DAYS}/"
 
-EXTRA_SYMBOLS = "•™£€¥"
-ALLOWED_CHARS = rf"a-zA-Z0-9\s{re.escape(EXTRA_SYMBOLS)}.,;:!?%$\/\-@&"
-
 s3 = boto3.client("s3", region_name=REGION)
 
 if "MODEL_DIR" in os.environ:
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
+
 
 # ---------- LOGGING CONFIG ----------
 def setup_logger():
@@ -71,11 +74,13 @@ model = None
 def is_docker():
     return "MODEL_DIR" in os.environ
 
+
 def get_tokenizer():
     global tokenizer
     if tokenizer is None:
         tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME_OR_DIR, local_files_only=is_docker())
     return tokenizer
+
 
 def get_model():
     global model
@@ -86,53 +91,114 @@ def get_model():
 
 
 # ---------- HELPERS ----------
+def retry_s3(operation, retry_count=RETRY_COUNT, retry_delay=RETRY_DELAY):
+    for attempt in range(retry_count):
+        try:
+            return operation()
+        except ClientError as e:
+            code = e.response["Error"]["Code"]
+            if code in ("Throttling", "ThrottlingException", "TooManyRequestsException",
+                        "SlowDown", "RequestTimeout", "InternalError", "503", "500"):
+                if attempt == retry_count - 1:
+                    raise
+
+                # Exponential backoff + jitter
+                sleep = retry_delay * (2 ** attempt) * (0.5 + random.random())
+                time.sleep(sleep)
+            else:
+                raise  # Non-retryable
+
+
 def read_parquet_s3(bucket, key):
-    obj = s3.get_object(Bucket=bucket, Key=key)
-    buf = BytesIO(obj["Body"].read())
-    return pq.read_table(buf).to_pandas()
+    def op():
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        buf = BytesIO(obj["Body"].read())
+        return pq.read_table(buf).to_pandas()
+
+    return retry_s3(op)
 
 
 def write_parquet_s3(df, bucket, key):
-    buf = BytesIO()
-    table = pa.Table.from_pandas(df)
-    pq.write_table(table, buf, compression="snappy")
-    s3.put_object(Bucket=bucket, Key=key, Body=buf.getvalue())
+    def op():
+        stable_df = df.reset_index(drop=True)
+
+        if "localDate" in stable_df.columns:
+            stable_df["localDate"] = stable_df["localDate"].astype(str)
+
+        for col in stable_df.columns:
+            if col != "localDate":
+                stable_df[col] = pd.to_numeric(stable_df[col], errors="coerce").astype(float)
+
+        buf = BytesIO()
+        table = pa.Table.from_pandas(stable_df)
+        pq.write_table(table, buf, compression="snappy")
+        s3.put_object(Bucket=bucket, Key=key, Body=buf.getvalue())
+
+    retry_s3(op)
 
 
 def read_collector_state():
-    try:
+    def op():
         obj = s3.get_object(Bucket=BUCKET, Key=COLLECTOR_STATE_KEY)
         data = json.loads(obj["Body"].read().decode("utf-8"))
         return datetime.strptime(data[LAST_ADDED_KEY], "%Y-%m-%d").date()
-    except s3.exceptions.ClientError:
+    
+    try:
+        return retry_s3(op)
+    except ClientError:
         raise ValueError(f"{COLLECTOR_STATE_KEY} is missing")
 
+
 def read_preproc_state():
-    try:
+    def op():
         obj = s3.get_object(Bucket=BUCKET, Key=PREPROC_STATE_KEY)
         data = json.loads(obj["Body"].read().decode("utf-8"))
         return datetime.strptime(data[LAST_PROCESSED_KEY], "%Y-%m-%d").date()
-    except s3.exceptions.ClientError:
+
+    try:
+        return retry_s3(op)
+    except ClientError:
         return datetime.strptime(START_DATE, "%Y-%m-%d").date() - timedelta(days=1)
 
 
 def write_preproc_state(date_obj):
-    payload = {LAST_PROCESSED_KEY: date_obj.strftime("%Y-%m-%d")}
-    s3.put_object(
-        Bucket=BUCKET,
-        Key=PREPROC_STATE_KEY,
-        Body=json.dumps(payload).encode("utf-8")
-    )
+    def op():
+        payload = {LAST_PROCESSED_KEY: date_obj.strftime("%Y-%m-%d")}
+        s3.put_object(
+            Bucket=BUCKET,
+            Key=PREPROC_STATE_KEY,
+            Body=json.dumps(payload).encode("utf-8")
+        )
+
+    retry_s3(op)
 
 
 def clean_text(text: str) -> str:
     if not isinstance(text, str):
         return ""
+
+    # Normalize unicode
     text = unicodedata.normalize("NFKC", text)
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = re.sub(f"[^{ALLOWED_CHARS}]", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+
+    cleaned = []
+    for ch in text:
+        cat = unicodedata.category(ch)
+
+        # Keep: letters, digits, punctuation, currency symbols, whitespace
+        if (
+            cat.startswith("L") or   # Letters
+            cat.startswith("N") or   # Numbers
+            cat.startswith("P") or   # Punctuation
+            cat == "Sc" or           # Currency symbol
+            ch.isspace()
+        ):
+            cleaned.append(ch)
+        else:
+            cleaned.append(" ")
+
+    # Collapse repeated whitespace
+    out = " ".join("".join(cleaned).split())
+    return out
 
 
 @torch.no_grad()
@@ -172,6 +238,7 @@ def detect_available_memory_mb() -> int:
 
     return 1024
 
+
 def choose_batch_size():
     mem = detect_available_memory_mb()
 
@@ -186,23 +253,30 @@ def choose_batch_size():
     else:
         return 8
 
+
 def fast_skew(x):
     arr = np.asarray(x, dtype=np.float64)
+    n = len(arr)
+    if n < 3:
+        return 0.0
     m = arr.mean()
     s = arr.std()
     if s == 0:
         return 0.0
-    n = len(arr)
     return np.sum(((arr - m) / s) ** 3) * (n / ((n - 1) * (n - 2)))
+
 
 def fast_kurtosis(x):
     arr = np.asarray(x, dtype=np.float64)
+    n = len(arr)
+    if n < 4:
+        return 0.0
     m = arr.mean()
     s = arr.std()
     if s == 0:
         return 0.0
-    n = len(arr)
     return np.sum(((arr - m) / s) ** 4) * (n / ((n - 1) * (n - 2))) - 3
+
 
 def get_sentiment(local_date: date):
     date_str = local_date.strftime("%Y-%m-%d")
@@ -211,15 +285,13 @@ def get_sentiment(local_date: date):
 
     try:
         return read_parquet_s3(BUCKET, sentiment_key)
-    except s3.exceptions.ClientError as e:
-        if e.response['Error']['Code'] == "NoSuchKey":
-            pass # sentiment not yet calculated, continue
-        else:
+    except ClientError as e:
+        if e.response['Error']['Code'] != "NoSuchKey":
             raise
 
     try:
         df = read_parquet_s3(BUCKET, raw_key)
-    except s3.exceptions.ClientError as e:
+    except ClientError as e:
         if e.response['Error']['Code'] == "NoSuchKey":
             # IMPORTANT: If raw parquet is missing or empty, DO NOT create sentiment/aggregated files.
             # This preserves the signal that raw data itself is missing and prevents silent imputation.
@@ -227,18 +299,19 @@ def get_sentiment(local_date: date):
         else:
             raise
 
-    if df.empty:
+    if df is None or df.empty:
         return None
 
-    df["title_clean"] = df["title"].map(clean_text)
-    df["body_clean"] = df["body"].map(clean_text)
+    df["title_clean"] = df["title"].fillna("").map(clean_text)
+    df["body_clean"] = df["body"].fillna("").map(clean_text)
     df["text_clean"] = df["title_clean"] + " " + df["body_clean"]
 
-    # Sentiment
     batch_size = choose_batch_size()
     tokenizer = get_tokenizer()
+
     sentiment_scores = []
     headline_sentiment_scores = []
+
     for i in range(0, len(df), batch_size):
         text_batch  = df["text_clean"].iloc[i : i + batch_size].tolist()
         title_batch = df["title_clean"].iloc[i : i + batch_size].tolist()
@@ -246,20 +319,15 @@ def get_sentiment(local_date: date):
         enc_text  = tokenizer(text_batch,  padding=True, truncation=True, max_length=256, return_tensors="pt")
         enc_title = tokenizer(title_batch, padding=True, truncation=True, max_length=32, return_tensors="pt")
 
-        combined = {}
-        for key in enc_text:
-            combined[key] = torch.cat([enc_text[key], enc_title[key]], dim=0)
+        text_scores  = analyze_sentiment(enc_text)
+        title_scores = analyze_sentiment(enc_title)
 
-        combined_scores = analyze_sentiment(combined)
-
-        half = len(combined_scores) // 2
-        sentiment_scores.extend(combined_scores[:half])
-        headline_sentiment_scores.extend(combined_scores[half:])
+        sentiment_scores.extend(text_scores)
+        headline_sentiment_scores.extend(title_scores)
 
     df["sentiment_score"] = sentiment_scores
     df["headline_sentiment_score"] = headline_sentiment_scores
 
-    # Additional fields needed for some aggregates
     df["is_positive"] = df["sentiment_score"] > 0
     df["is_negative"] = df["sentiment_score"] < 0
     df["is_neutral"]  = df["sentiment_score"].abs() < 0.1
@@ -269,14 +337,14 @@ def get_sentiment(local_date: date):
     write_parquet_s3(df, BUCKET, sentiment_key)
     return df
 
+
 def get_aggregated(local_date: date):
     date_str = local_date.strftime("%Y-%m-%d")
-    sentiment_key = f"{SENTIMENT_PREFIX}{date_str}/data.parquet"
     aggregated_key = f"{AGGREGATED_PREFIX}{date_str}/data.parquet"
 
     try:
         return read_parquet_s3(BUCKET, aggregated_key)
-    except s3.exceptions.ClientError as e:
+    except ClientError as e:
         if e.response['Error']['Code'] == "NoSuchKey":
             pass  # features not yet aggregated, continue
         else:
@@ -319,6 +387,7 @@ def get_aggregated(local_date: date):
     write_parquet_s3(result, BUCKET, aggregated_key)
     return result
 
+
 def stop_early(current, context=None):
     if context is not None and int(context.get_remaining_time_in_millis()) < MIN_REMAINING_MS:
         logger.warning(f"Stopping early at {current} due to timeout limit.")
@@ -326,51 +395,47 @@ def stop_early(current, context=None):
     else:
         return False
 
+
 def generate_lagged_features(context=None):
     try:    
         last_done = read_preproc_state()
-        current = last_done + timedelta(days=1)
-        last_added = read_collector_state()
+        if last_done is None:
+            current = datetime.strptime(START_DATE, "%Y-%m-%d").date()
+        else:
+            current = last_done + timedelta(days=1)
 
-        columns = [
-            "mean_sentiment",
-            "count_articles",
-            "median_sentiment",
-            "pct_positive",
-            "pct_negative",
-            "polarity_ratio",
-            "weighted_mean_sentiment",
-            "extreme_sentiment_share",
-            "sentiment_skewness",
-            "sentiment_kurtosis",
-            "neutral_share",
-            "max_sentiment",
-            "min_sentiment",
-            "headline_mean_sentiment",
-            "headline_median_sentiment",
-            "article_length_variance",
-            "ratio_pos_neg",
-            "conflict_share",
-        ]
+        last_added = read_collector_state()
+        if last_added is None:
+            return {"statusCode": 200, "body": "no raw data to process"}
 
         lagged_rows = []
 
         window = deque(maxlen=LAG_DAYS)
-        for i in range(1, LAG_DAYS + 1):
+        for i in range(LAG_DAYS, 0, -1):
             d = current - timedelta(days=i)
             agg = get_aggregated(d)
-            window.appendleft(agg)   # oldest first
+            window.append(agg)
 
         while current <= last_added:
 
             if stop_early(current, context):
                 break
 
+            first_valid = next((a for a in window if a is not None), None)
+            if first_valid is None:
+                columns = []
+            else:
+                columns = [c for c in first_valid.columns if c not in ("localDate",)]
+
             row: dict[str, float | str] = {"localDate": current.strftime("%Y-%m-%d")}
 
-            for i, agg in enumerate(window, start=1):
+            for i, agg in enumerate(window):
+                lag_number = LAG_DAYS - i
                 for col in columns:
-                    row[f"{col}-{i}"] = agg[col].iloc[0] if agg is not None else float("nan")
+                    value = np.nan
+                    if agg is not None and col in agg.columns and not agg.empty:
+                        value = float(agg[col].iloc[0])
+                    row[f"{col}-{lag_number}"] = value
 
             lagged_rows.append(row)
             logger.info(f"Computed lagged features for {current}")
