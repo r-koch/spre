@@ -19,6 +19,10 @@ public class StockRecord implements ParquetRecord<StockRecord> {
   private static final String OPEN = "open";
   private static final String VOLUME = "volume";
 
+  public static StockRecord of(final LocalDate localDate, final String id) {
+    return new StockRecord(localDate, id, 0, 0, 0, 0, 0);
+  }
+
   public static StockRecord of(final LocalDate localDate, final String id, final double close, final double high, final double low, final double open,
       final long volume) {
     return new StockRecord(localDate, id, close, high, low, open, volume);

@@ -14,6 +14,7 @@ import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 import dev.rkoch.spre.stock.collector.StockRecord;
+import dev.rkoch.spre.stock.collector.Symbol;
 import dev.rkoch.spre.stock.collector.exception.NoDataForDateException;
 import dev.rkoch.spre.stock.collector.exception.SymbolNotFoundException;
 
@@ -50,10 +51,10 @@ public class NasdaqApi {
   }
 
   private String getApiSymbol(final String symbol) {
-    if ("fi".equalsIgnoreCase(symbol)) {
-      // from 2025-11-21 fi -> fisv
+    if (Symbol.FI.name().equalsIgnoreCase(symbol)) {
+      // after 2025-11-20 fisv replaces fi
       // api gets data with new symbol for old dates
-      return "fisv";
+      return Symbol.FISV.name();
     } else {
       // for symbols like bf.b the "." needs to be replaced with "%sl%" and "%" url encoded to "%25"
       return symbol.replace(".", "%25sl%25");
@@ -67,6 +68,14 @@ public class NasdaqApi {
     } else {
       throw new NoDataForDateException(date);
     }
+  }
+
+  private Map<LocalDate, StockRecord> getEmptyRecords(final String symbol) {
+    Map<LocalDate, StockRecord> records = new HashMap<>();
+    for (LocalDate date = fromDate; date.isBefore(toDate.plusDays(1)); date = date.plusDays(1)) {
+      records.put(date, StockRecord.of(date, symbol));
+    }
+    return records;
   }
 
   private String getJsonString(final String symbol) {
@@ -102,8 +111,13 @@ public class NasdaqApi {
       }
       return records;
     } catch (SymbolNotFoundException e) {
-      e.setSymbol(symbol);
-      throw e;
+      if (Symbol.IPG.name().equalsIgnoreCase(symbol)) {
+        // after 2025-11-21 delisted
+        return getEmptyRecords(symbol);
+      } else {
+        e.setSymbol(symbol);
+        throw e;
+      }
     }
   }
 
