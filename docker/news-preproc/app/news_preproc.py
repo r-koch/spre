@@ -22,13 +22,15 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification
 BUCKET = os.environ.get("BUCKET", "dev-rkoch-spre")
 REGION = os.environ.get("AWS_REGION", "eu-west-1")
 LAG_DAYS = int(os.environ.get("LAG_DAYS", "5"))
-START_DATE = os.environ.get("START_DATE", "1999-10-27")
+START_DATE = os.environ.get("START_DATE", "1999-11-01")
 MIN_REMAINING_MS = int(os.environ.get("MIN_REMAINING_MS", "60000"))
 MODEL_NAME_OR_DIR = os.environ.get("MODEL_DIR", "ProsusAI/finbert")  # locally use model name, in docker use env
 RETRY_COUNT = int(os.environ.get("RETRY_COUNT", "3"))
 RETRY_DELAY_S = float(os.environ.get("RETRY_DELAY_S", "0.25"))
 RETRY_MAX_DELAY_S = float(os.environ.get("RETRY_MAX_DELAY_S", "2.0"))
-TOKENIZER_MAX_LENGTH = int(os.environ.get("TOKENIZER_MAX_LENGTH", "512"))
+
+ONE_DAY = timedelta(days=1)
+TOKENIZER_MAX_LENGTH = 512
 
 META_DATA = "metadata/"
 COLLECTOR_STATE_KEY = f"{META_DATA}news_collector_state.json"
@@ -41,9 +43,6 @@ RAW_PREFIX = "raw/news/localDate="
 SENTIMENT_PREFIX = "news/sentiment/localDate="
 AGGREGATED_PREFIX = "news/aggregated/localDate="
 LAGGED_PREFIX = f"news/lagged-{LAG_DAYS}/"
-TMP_PREFIX = "tmp/"
-
-ONE_DAY = timedelta(days=1)
 
 s3 = boto3.client("s3", region_name=REGION)
 
@@ -99,7 +98,7 @@ AGGREGATED_SCHEMA = pa.schema({
 AGGREGATED_COLUMNS = [name for name in AGGREGATED_SCHEMA.names if name != "localDate"]
 
 def build_lagged_schema():
-    fields = [pa.field("localDate", pa.string())]
+    fields = [pa.field("localDate", pa.date32())]
 
     for lag in range(1, LAG_DAYS + 1):
         for col in AGGREGATED_COLUMNS:
@@ -190,6 +189,24 @@ def retry_s3(operation, retry_count=RETRY_COUNT, retry_delay=RETRY_DELAY_S, retr
             raise  # No retry
 
 
+def pandas_dtype_for_arrow_type(pa_type):
+    if pa.types.is_int8(pa_type):
+        return pd.Int8Dtype()
+    if pa.types.is_int16(pa_type):
+        return pd.Int16Dtype()
+    if pa.types.is_int32(pa_type):
+        return pd.Int32Dtype()
+    if pa.types.is_int64(pa_type):
+        return pd.Int64Dtype()
+    if pa.types.is_floating(pa_type):
+        return np.float32
+    if pa.types.is_string(pa_type) or pa.types.is_large_string(pa_type):
+        return pd.StringDtype()
+    if pa.types.is_date32(pa_type) or pa.types.is_date64(pa_type) or pa.types.is_timestamp(pa_type):
+        return "datetime64[ns]"
+    return None
+
+
 def read_parquet_s3(bucket, key, schema):
     def op():
         obj = s3.get_object(Bucket=bucket, Key=key)
@@ -199,7 +216,7 @@ def read_parquet_s3(bucket, key, schema):
         except Exception as e:
             raise ValueError(f"Corrupted parquet at {key}: {e}")
 
-        if schema != table.schema:
+        if schema_mismatch(schema, table.schema):
             raise ValueError(f"Schema mismatch for {key}. Expected {schema}, got {table.schema}")
         
         dtype_map = {}
@@ -227,47 +244,33 @@ def read_parquet_s3(bucket, key, schema):
                 dtype_map[name] = None
 
         return table.to_pandas(
-            types_mapper=lambda t: (
-                dtype_map.get(t._name, None)
-            )
+            types_mapper=lambda pa_type: pandas_dtype_for_arrow_type(pa_type)
         )
 
     return retry_s3(op)
 
 
 def write_parquet_s3(df, bucket, key, schema):
-    def op():
-        stable_df = df.reset_index(drop=True)
+    if schema is None:
+        raise ValueError("Schema must not be None for write_parquet_s3")
 
-        if schema is None:
-            if "localDate" in stable_df.columns:
-                stable_df["localDate"] = stable_df["localDate"].astype(str)
+    incoming_cols = set(df.columns)
+    expected_cols = set(schema.names)
+    if incoming_cols != expected_cols:
+        raise ValueError(f"Column mismatch for {key}: expected {expected_cols}, got {incoming_cols}")
 
-            for col in stable_df.columns:
-                if col != "localDate":
-                    stable_df[col] = pd.to_numeric(stable_df[col], errors="coerce").astype(float)
+    df = df.copy()
+    df = df[list(schema.names)]
 
-            stable_df = stable_df.reindex(sorted(stable_df.columns), axis=1)
-        else:
-            expected_cols = set(schema.names)
-            incoming_cols = set(stable_df.columns)
-            if incoming_cols != expected_cols:
-                missing = expected_cols - incoming_cols
-                extra = incoming_cols - expected_cols
-                raise ValueError(f"Schema mismatch. Missing: {missing} Extra: {extra}")
+    table = pa.Table.from_pandas(df, schema=schema, preserve_index=False)
 
-            stable_df = stable_df[schema.names]
+    buffer = BytesIO()
+    pq.write_table(table, buffer)
+    temp_key = key + ".tmp"
 
-        buf = BytesIO()
-        table = pa.Table.from_pandas(stable_df, schema=schema, preserve_index=False)
-        pq.write_table(table, buf, compression="snappy")
-
-        temp_key = f"{TMP_PREFIX}{uuid.uuid4().hex}"
-        s3.put_object(Bucket=bucket, Key=temp_key, Body=buf.getvalue())
-        s3.copy_object(Bucket=bucket, CopySource={"Bucket": bucket, "Key": temp_key}, Key=key)
-        s3.delete_object(Bucket=bucket, Key=temp_key)
-
-    retry_s3(op)
+    retry_s3(lambda: s3.put_object(Bucket=bucket, Key=temp_key, Body=buffer.getvalue()))
+    retry_s3(lambda: s3.copy_object(Bucket=bucket, CopySource={"Bucket": bucket, "Key": temp_key}, Key=key))
+    retry_s3(lambda: s3.delete_object(Bucket=bucket, Key=temp_key))
 
 
 def read_collector_state():
@@ -308,6 +311,18 @@ def write_preproc_state(date_obj):
     retry_s3(op)
 
 
+def schema_mismatch(expected: pa.Schema, actual: pa.Schema) -> bool:
+    if len(expected) != len(actual):
+        return True
+
+    for f_exp, f_act in zip(expected, actual):
+        if f_exp.name != f_act.name:
+            return True
+        if not f_exp.type.equals(f_act.type):
+            return True
+    return False
+
+
 def clean_text(text: str) -> str:
     if not isinstance(text, str):
         return ""
@@ -343,13 +358,7 @@ def analyze_sentiment(batch):
     model = get_model()
     outputs = model(**encodings)
     probs = torch.nn.functional.softmax(outputs.logits, dim=-1).cpu()
-
-    labels = probs.argmax(dim=-1).tolist()
-    scores = []
-    for i in enumerate(labels):
-        score = probs[i][2].item() - probs[i][0].item()
-        scores.append(score)
-
+    scores = (probs[:, 2] - probs[:, 0]).tolist()
     return scores
 
 
@@ -454,7 +463,7 @@ def get_sentiment(local_date: date):
     df["is_negative"] = df["sentiment_score"] < 0
     df["is_neutral"]  = df["sentiment_score"].abs() < 0.1
     df["is_extreme"]  = df["sentiment_score"].abs() > 0.5
-    df["text_length"] = df["text_clean"].str.len().fillna(0).astype(float)
+    df["text_length"] = df["text_clean"].str.len().fillna(0).astype("int32")
 
     write_parquet_s3(df, BUCKET, sentiment_key, SENTIMENT_SCHEMA)
     return df
@@ -465,62 +474,68 @@ def get_aggregated(local_date: date):
     aggregated_key = f"{AGGREGATED_PREFIX}{date_str}/data.parquet"
 
     try:
-        return read_parquet_s3(BUCKET, aggregated_key, AGGREGATED_SCHEMA)
+        result = read_parquet_s3(BUCKET, aggregated_key, AGGREGATED_SCHEMA)
     except ClientError as e:
         if e.response.get("Error", {}).get("Code", "") != "NoSuchKey":
             raise
 
-    df = get_sentiment(local_date)
-    if df is None:
-        return pd.DataFrame({
-            "localDate": [date_str],
-            "count_articles": [0],
-            "mean_sentiment": [0.0],
-            "median_sentiment": [0.0],
-            "pct_positive": [0.0],
-            "pct_negative": [0.0],
-            "polarity_ratio": [0.0],
-            "weighted_mean_sentiment": [0.0],
-            "extreme_sentiment_share": [0.0],
-            "sentiment_skewness": [0.0],
-            "sentiment_kurtosis": [0.0],
-            "neutral_share": [0.0],
-            "max_sentiment": [0.0],
-            "min_sentiment": [0.0],
-            "article_length_variance": [0.0],
-            "ratio_pos_neg": [0.0],
-            "conflict_share": [0.0],
-        })
+        df = get_sentiment(local_date)
+        if df is None:
+            result = pd.DataFrame({
+                "localDate": [date_str],
+                "count_articles": [0],
+                "mean_sentiment": [0.0],
+                "median_sentiment": [0.0],
+                "pct_positive": [0.0],
+                "pct_negative": [0.0],
+                "polarity_ratio": [0.0],
+                "weighted_mean_sentiment": [0.0],
+                "extreme_sentiment_share": [0.0],
+                "sentiment_skewness": [0.0],
+                "sentiment_kurtosis": [0.0],
+                "neutral_share": [0.0],
+                "max_sentiment": [0.0],
+                "min_sentiment": [0.0],
+                "article_length_variance": [0.0],
+                "ratio_pos_neg": [0.0],
+                "conflict_share": [0.0],
+            })
+        else:
+            result = pd.DataFrame({
+                "localDate": [date_str],
+                "count_articles": [len(df)],
+                "mean_sentiment": [df["sentiment_score"].mean()],
+                "median_sentiment": [df["sentiment_score"].median()],
+                "pct_positive": [(df["is_positive"].mean())],
+                "pct_negative": [(df["is_negative"].mean())],
+                "polarity_ratio": [(df["is_positive"].mean() - df["is_negative"].mean())],
+                "weighted_mean_sentiment": [
+                    (df["sentiment_score"] * df["text_length"]).sum() /
+                    (df["text_length"].sum() + 1e-9)
+                ],
+                "extreme_sentiment_share": [df["is_extreme"].mean()],
+                "sentiment_skewness": [fast_skew(df["sentiment_score"].values)],
+                "sentiment_kurtosis": [fast_kurtosis(df["sentiment_score"].values)],
+                "neutral_share": [df["is_neutral"].mean()],
+                "max_sentiment": [df["sentiment_score"].max()],
+                "min_sentiment": [df["sentiment_score"].min()],
+                "article_length_variance": [df["text_length"].var(ddof=0)],
+                "ratio_pos_neg": [
+                    (df["is_positive"].mean()) /
+                    (df["is_negative"].mean() + 1e-9)
+                ],
+                "conflict_share": [  # A "conflict" is defined as mild sentiment: abs(score) in [0.05, 0.15]
+                    (df["sentiment_score"].abs().between(0.05, 0.15)).mean()
+                ],
+            })
+            write_parquet_s3(result, BUCKET, aggregated_key, AGGREGATED_SCHEMA)
 
-    result = pd.DataFrame({
-        "localDate": [date_str],
-        "count_articles": [len(df)],
-        "mean_sentiment": [df["sentiment_score"].mean()],
-        "median_sentiment": [df["sentiment_score"].median()],
-        "pct_positive": [(df["is_positive"].mean())],
-        "pct_negative": [(df["is_negative"].mean())],
-        "polarity_ratio": [(df["is_positive"].mean() - df["is_negative"].mean())],
-        "weighted_mean_sentiment": [
-            (df["sentiment_score"] * df["text_length"]).sum() /
-            (df["text_length"].sum() + 1e-9)
-        ],
-        "extreme_sentiment_share": [df["is_extreme"].mean()],
-        "sentiment_skewness": [fast_skew(df["sentiment_score"].values)],
-        "sentiment_kurtosis": [fast_kurtosis(df["sentiment_score"].values)],
-        "neutral_share": [df["is_neutral"].mean()],
-        "max_sentiment": [df["sentiment_score"].max()],
-        "min_sentiment": [df["sentiment_score"].min()],
-        "article_length_variance": [df["text_length"].var(ddof=0)],
-        "ratio_pos_neg": [
-            (df["is_positive"].mean()) /
-            (df["is_negative"].mean() + 1e-9)
-        ],
-        "conflict_share": [
-            (df["sentiment_score"].abs().between(0.05, 0.15)).mean()
-        ],
-    })
+    if result is None:
+        raise ValueError("Unexpected None result in get_aggregated()")
 
-    write_parquet_s3(result, BUCKET, aggregated_key, AGGREGATED_SCHEMA)
+    if len(result) != 1:
+        raise ValueError(f"Aggregated result for {local_date} has {len(result)} rows, expected 1")
+    
     return result
 
 
@@ -576,7 +591,7 @@ def generate_lagged_features(context=None):
 
         # If nothing was computed → exit cleanly
         if not lagged_rows:
-            return {"statusCode": 500, "body": "no lagged features computed. stopped early? this should not happen!"}
+            return {"statusCode": 200, "body": "no lagged features computed due to lambda timeout"}
 
         # Write one new parquet chunk for this invocation
         lagged_df = pd.DataFrame(lagged_rows)
