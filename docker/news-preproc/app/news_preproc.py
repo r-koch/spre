@@ -183,10 +183,16 @@ def get_model():
         model.to(get_device())
         model.eval()
 
-        expected = {0: "negative", 1: "neutral", 2: "positive"}
         cfg_map = model.config.id2label
-        if cfg_map != expected:
-            raise ValueError(f"Unexpected FinBERT id2label mapping: {cfg_map}")
+        try:
+            model.pos_idx = next(
+                k for k, v in cfg_map.items() if v.lower() == "positive"
+            )
+            model.neg_idx = next(
+                k for k, v in cfg_map.items() if v.lower() == "negative"
+            )
+        except StopIteration:
+            raise ValueError(f"Model has no valid positive/negative mapping: {cfg_map}")
 
     return model
 
@@ -370,7 +376,7 @@ def analyze_sentiment(texts):
     model = get_model()
     outputs = model(**encodings)
     probs = torch.nn.functional.softmax(outputs.logits, dim=-1).cpu()
-    scores = (probs[:, 2] - probs[:, 0]).tolist()
+    scores = (probs[:, model.pos_idx] - probs[:, model.neg_idx]).tolist()
     return scores, token_counts
 
 
@@ -631,14 +637,14 @@ def continue_execution(context=None):
     return True
 
 
-def append_lag_row(builders: dict, py_date: date, window: deque):
-    builders["localDate"].append(pa.scalar(py_date, type=pa.date32()))
+def append_lagged_row(lagged_columns: dict, py_date: date, window: deque):
+    lagged_columns["localDate"].append(py_date)
     lag = LAG_DAYS
 
     for agg_table in window:
         for col in AGGREGATED_COLUMNS:
-            value = agg_table[col][0]
-            builders[f"{col}-{lag}"].append(value)
+            value = agg_table[col][0].as_py()
+            lagged_columns[f"{col}-{lag}"].append(value)
         lag -= 1
 
 
@@ -660,20 +666,20 @@ def generate_lagged_features(context=None):
             agg_table = get_aggregated(lag_date)
             rolling_window.append(agg_table)
 
-        builders = {
-            field.name: field.type._default_array_type().builder()
-            for field in LAGGED_SCHEMA
-        }
+        lagged_columns = {field.name: [] for field in LAGGED_SCHEMA}
 
         rows_written = 0
 
         while continue_execution(context):
+            if rows_written == 10:
+                break
+
             prev = current - ONE_DAY
             if prev > last_added:
                 break
 
             rolling_window.append(get_aggregated(prev))
-            append_lag_row(builders, current, rolling_window)
+            append_lagged_row(lagged_columns, current, rolling_window)
             rows_written += 1
             last_processed = current
             logger.info(f"Computed lagged features for {current}")
@@ -685,7 +691,9 @@ def generate_lagged_features(context=None):
                 "body": "no lagged features computed due to lambda timeout",
             }
 
-        arrays = [builders[f.name].finish() for f in LAGGED_SCHEMA]
+        arrays = [
+            pa.array(lagged_columns[field.name], type=field.type) for field in LAGGED_SCHEMA
+        ]
         lagged_table = pa.Table.from_arrays(arrays, schema=LAGGED_SCHEMA)
 
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
