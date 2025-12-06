@@ -1,6 +1,5 @@
 from collections import deque
 import json
-import uuid
 import logging
 import os
 from typing import cast
@@ -12,7 +11,6 @@ from io import BytesIO
 from datetime import date, datetime, timedelta, timezone
 import boto3
 import numpy as np
-import pandas as pd
 import pyarrow.parquet as pq
 import pyarrow as pa
 import torch
@@ -24,12 +22,19 @@ REGION = os.environ.get("AWS_REGION", "eu-west-1")
 LAG_DAYS = int(os.environ.get("LAG_DAYS", "5"))
 START_DATE = os.environ.get("START_DATE", "1999-11-01")
 MIN_REMAINING_MS = int(os.environ.get("MIN_REMAINING_MS", "60000"))
-MODEL_NAME_OR_DIR = os.environ.get("MODEL_DIR", "ProsusAI/finbert")  # locally use model name, in docker use env
+MODEL_NAME_OR_DIR = os.environ.get(
+    "MODEL_DIR", "ProsusAI/finbert"
+)  # locally use model name, in docker use env
 RETRY_COUNT = int(os.environ.get("RETRY_COUNT", "3"))
 RETRY_DELAY_S = float(os.environ.get("RETRY_DELAY_S", "0.25"))
 RETRY_MAX_DELAY_S = float(os.environ.get("RETRY_MAX_DELAY_S", "2.0"))
 
+CONFLICT_THRESHOLD_LOW = np.float32(0.05)
+CONFLICT_THRESHOLD_HIGH = np.float32(0.15)
+EXTREME_THRESHOLD = np.float32(0.5)
+NEUTRAL_THRESHOLD = np.float32(0.1)
 ONE_DAY = timedelta(days=1)
+PREVENT_DIV_BY_ZERO = 1e-9
 TOKENIZER_MAX_LENGTH = 512
 
 META_DATA = "metadata/"
@@ -39,6 +44,7 @@ PREPROC_STATE_KEY = f"{META_DATA}news_preproc_state.json"
 LAST_PROCESSED_KEY = "lastProcessed"
 LAST_ADDED_KEY = "lastAdded"
 
+TEMP_PREFIX = "tmp/"
 RAW_PREFIX = "raw/news/localDate="
 SENTIMENT_PREFIX = "news/sentiment/localDate="
 AGGREGATED_PREFIX = "news/aggregated/localDate="
@@ -52,61 +58,80 @@ if "MODEL_DIR" in os.environ:
 
 # ---------- SCHEMAS ----------
 
-RAW_SCHEMA = pa.schema({
-    "localDate": pa.date32(),
-    "id": pa.string(),
-    "title": pa.string(),
-    "body": pa.string(),
-})
+RAW_SCHEMA = pa.schema(
+    {
+        "localDate": pa.date32(),
+        "id": pa.string(),
+        "title": pa.string(),
+        "body": pa.string(),
+    }
+)
 
-SENTIMENT_SCHEMA = pa.schema({
-    "localDate": pa.date32(),
-    "id": pa.string(),
-    "title": pa.string(),
-    "body": pa.string(),
-    "title_clean": pa.string(),
-    "body_clean": pa.string(),
-    "text_clean": pa.string(),
-    "sentiment_score": pa.float32(),
-    "is_positive": pa.int8(),
-    "is_negative": pa.int8(),
-    "is_neutral": pa.int8(),
-    "is_extreme": pa.int8(),
-    "text_length": pa.int32(),
-})
+SENTIMENT_SCHEMA = pa.schema(
+    {
+        "localDate": pa.date32(),
+        "id": pa.string(),
+        "sentiment_score": pa.float32(),
+        "text_length": pa.int32(),
+        "token_count": pa.int32(),
+    }
+)
 
-AGGREGATED_SCHEMA = pa.schema({
-    "localDate": pa.date32(),
-    "count_articles": pa.int32(),
-    "mean_sentiment": pa.float32(),
-    "median_sentiment": pa.float32(),
-    "pct_positive": pa.float32(),
-    "pct_negative": pa.float32(),
-    "polarity_ratio": pa.float32(),
-    "weighted_mean_sentiment": pa.float32(),
-    "extreme_sentiment_share": pa.float32(),
-    "sentiment_skewness": pa.float32(),
-    "sentiment_kurtosis": pa.float32(),
-    "neutral_share": pa.float32(),
-    "max_sentiment": pa.float32(),
-    "min_sentiment": pa.float32(),
-    "article_length_variance": pa.float32(),
-    "ratio_pos_neg": pa.float32(),
-    "conflict_share": pa.float32(),
-})
+AGGREGATED_SCHEMA = pa.schema(
+    {
+        "localDate": pa.date32(),
+        "count_articles": pa.int32(),
+        "mean_sentiment": pa.float32(),
+        "median_sentiment": pa.float32(),
+        "pct_positive": pa.float32(),
+        "pct_negative": pa.float32(),
+        "polarity_ratio": pa.float32(),
+        "weighted_mean_sentiment": pa.float32(),
+        "extreme_sentiment_share": pa.float32(),
+        "sentiment_skewness": pa.float32(),
+        "sentiment_kurtosis": pa.float32(),
+        "neutral_share": pa.float32(),
+        "max_sentiment": pa.float32(),
+        "min_sentiment": pa.float32(),
+        "article_length_variance": pa.float32(),
+        "ratio_pos_neg": pa.float32(),
+        "conflict_share": pa.float32(),
+    }
+)
 
 AGGREGATED_COLUMNS = [name for name in AGGREGATED_SCHEMA.names if name != "localDate"]
 
+
 def build_lagged_schema():
     fields = [pa.field("localDate", pa.date32())]
-
     for lag in range(1, LAG_DAYS + 1):
         for col in AGGREGATED_COLUMNS:
             fields.append(pa.field(f"{col}-{lag}", pa.float32()))
 
     return pa.schema(fields)
 
+
 LAGGED_SCHEMA = build_lagged_schema()
+
+EMPTY_AGG_VALUES = {
+    "count_articles": pa.array([0], pa.int32()),
+    "mean_sentiment": pa.array([0.0], pa.float32()),
+    "median_sentiment": pa.array([0.0], pa.float32()),
+    "pct_positive": pa.array([0.0], pa.float32()),
+    "pct_negative": pa.array([0.0], pa.float32()),
+    "polarity_ratio": pa.array([0.0], pa.float32()),
+    "weighted_mean_sentiment": pa.array([0.0], pa.float32()),
+    "extreme_sentiment_share": pa.array([0.0], pa.float32()),
+    "sentiment_skewness": pa.array([0.0], pa.float32()),
+    "sentiment_kurtosis": pa.array([0.0], pa.float32()),
+    "neutral_share": pa.array([0.0], pa.float32()),
+    "max_sentiment": pa.array([0.0], pa.float32()),
+    "min_sentiment": pa.array([0.0], pa.float32()),
+    "article_length_variance": pa.array([0.0], pa.float32()),
+    "ratio_pos_neg": pa.array([0.0], pa.float32()),
+    "conflict_share": pa.array([0.0], pa.float32()),
+}
+
 
 # ---------- LOGGING CONFIG ----------
 def setup_logger():
@@ -119,7 +144,9 @@ def setup_logger():
         formatter = logging.Formatter("[%(levelname)s] %(message)s")
         logger.setLevel(logging.INFO)
     else:
-        formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s:%(lineno)d - %(message)s")
+        formatter = logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s:%(lineno)d - %(message)s"
+        )
         logger.setLevel(logging.DEBUG)
 
     handler.setFormatter(formatter)
@@ -133,6 +160,7 @@ logger = setup_logger()
 tokenizer = None
 model = None
 
+
 def is_docker():
     return "MODEL_DIR" in os.environ
 
@@ -140,14 +168,18 @@ def is_docker():
 def get_tokenizer():
     global tokenizer
     if tokenizer is None:
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME_OR_DIR, local_files_only=is_docker())
+        tokenizer = AutoTokenizer.from_pretrained(
+            MODEL_NAME_OR_DIR, local_files_only=is_docker()
+        )
     return tokenizer
 
 
 def get_model():
     global model
     if model is None:
-        model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME_OR_DIR, local_files_only=is_docker())
+        model = AutoModelForSequenceClassification.from_pretrained(
+            MODEL_NAME_OR_DIR, local_files_only=is_docker()
+        )
         model.to(get_device())
         model.eval()
 
@@ -155,7 +187,7 @@ def get_model():
         cfg_map = model.config.id2label
         if cfg_map != expected:
             raise ValueError(f"Unexpected FinBERT id2label mapping: {cfg_map}")
-        
+
     return model
 
 
@@ -166,22 +198,32 @@ def get_device():
 
 
 # ---------- HELPERS ----------
-def retry_s3(operation, retry_count=RETRY_COUNT, retry_delay=RETRY_DELAY_S, retry_max_delay=RETRY_MAX_DELAY_S):
+def retry_s3(
+    operation,
+    retry_count=RETRY_COUNT,
+    retry_delay=RETRY_DELAY_S,
+    retry_max_delay=RETRY_MAX_DELAY_S,
+):
     for attempt in range(retry_count):
         try:
             return operation()
         except ClientError as e:
             if attempt < retry_count - 1:
                 code = e.response.get("Error", {}).get("Code", "")
-                retryable = code.startswith("5") or "Throttl" in code or code in (
-                    "SlowDown",
-                    "RequestTimeout",
-                    "RequestTimeTooSkewed",
-                    "InternalError",
+                retryable = (
+                    code.startswith("5")
+                    or "Throttl" in code
+                    or code
+                    in (
+                        "SlowDown",
+                        "RequestTimeout",
+                        "RequestTimeTooSkewed",
+                        "InternalError",
+                    )
                 )
 
                 if retryable:
-                    max_sleep = min(retry_delay * (2 ** attempt), retry_max_delay)
+                    max_sleep = min(retry_delay * (2**attempt), retry_max_delay)
                     sleep = random.uniform(0, max_sleep)
                     time.sleep(sleep)
                     continue
@@ -189,96 +231,57 @@ def retry_s3(operation, retry_count=RETRY_COUNT, retry_delay=RETRY_DELAY_S, retr
             raise  # No retry
 
 
-def pandas_dtype_for_arrow_type(pa_type):
-    if pa.types.is_int8(pa_type):
-        return pd.Int8Dtype()
-    if pa.types.is_int16(pa_type):
-        return pd.Int16Dtype()
-    if pa.types.is_int32(pa_type):
-        return pd.Int32Dtype()
-    if pa.types.is_int64(pa_type):
-        return pd.Int64Dtype()
-    if pa.types.is_floating(pa_type):
-        return np.float32
-    if pa.types.is_string(pa_type) or pa.types.is_large_string(pa_type):
-        return pd.StringDtype()
-    if pa.types.is_date32(pa_type) or pa.types.is_date64(pa_type) or pa.types.is_timestamp(pa_type):
-        return "datetime64[ns]"
-    return None
-
-
-def read_parquet_s3(bucket, key, schema):
+def read_parquet_s3(bucket: str, key: str, schema: pa.Schema) -> pa.Table:
     def op():
-        obj = s3.get_object(Bucket=bucket, Key=key)
-        buf = BytesIO(obj["Body"].read())
+        s3_object = s3.get_object(Bucket=bucket, Key=key)
+        buffer = BytesIO(s3_object["Body"].read())
         try:
-            table = pq.read_table(buf)
+            table = pq.read_table(buffer, columns=schema.names)
         except Exception as e:
             raise ValueError(f"Corrupted parquet at {key}: {e}")
 
         if schema_mismatch(schema, table.schema):
-            raise ValueError(f"Schema mismatch for {key}. Expected {schema}, got {table.schema}")
-        
-        dtype_map = {}
-        for field in schema:
-            name = field.name
-            pa_type = field.type
+            raise ValueError(
+                f"Schema mismatch for {key}. Expected {schema}, got {table.schema}"
+            )
 
-            if pa.types.is_int8(pa_type):
-                dtype_map[name] = pd.Int8Dtype()
-            elif pa.types.is_int16(pa_type):
-                dtype_map[name] = pd.Int16Dtype()
-            elif pa.types.is_int32(pa_type):
-                dtype_map[name] = pd.Int32Dtype()
-            elif pa.types.is_int64(pa_type):
-                dtype_map[name] = pd.Int64Dtype()
-            elif pa.types.is_floating(pa_type):
-                # force float32 for your pipeline
-                dtype_map[name] = np.float32
-            elif pa.types.is_string(pa_type):
-                dtype_map[name] = pd.StringDtype()
-            elif pa.types.is_date(pa_type):
-                dtype_map[name] = "datetime64[ns]"
-            else:
-                # Fallback: let pandas infer
-                dtype_map[name] = None
-
-        return table.to_pandas(
-            types_mapper=lambda pa_type: pandas_dtype_for_arrow_type(pa_type)
-        )
+        return table
 
     return retry_s3(op)
 
 
-def write_parquet_s3(df, bucket, key, schema):
+def write_parquet_s3(table, bucket, key, schema):
+    if table is None:
+        raise ValueError("table must not be None for write_parquet_s3")
+
     if schema is None:
         raise ValueError("Schema must not be None for write_parquet_s3")
 
-    incoming_cols = set(df.columns)
-    expected_cols = set(schema.names)
-    if incoming_cols != expected_cols:
-        raise ValueError(f"Column mismatch for {key}: expected {expected_cols}, got {incoming_cols}")
-
-    df = df.copy()
-    df = df[list(schema.names)]
-
-    table = pa.Table.from_pandas(df, schema=schema, preserve_index=False)
+    if schema_mismatch(schema, table.schema):
+        raise ValueError(
+            f"Schema mismatch for {key}. Expected {schema}, got {table.schema}"
+        )
 
     buffer = BytesIO()
-    pq.write_table(table, buffer)
-    temp_key = key + ".tmp"
+    pq.write_table(table, buffer, compression="zstd", compression_level=3)
+    data = buffer.getvalue()
 
-    retry_s3(lambda: s3.put_object(Bucket=bucket, Key=temp_key, Body=buffer.getvalue()))
-    retry_s3(lambda: s3.copy_object(Bucket=bucket, CopySource={"Bucket": bucket, "Key": temp_key}, Key=key))
+    temp_key = f"{TEMP_PREFIX}{key}"
+    retry_s3(lambda: s3.put_object(Bucket=bucket, Key=temp_key, Body=data))
+    retry_s3(
+        lambda: s3.copy_object(
+            Bucket=bucket, CopySource={"Bucket": bucket, "Key": temp_key}, Key=key
+        )
+    )
     retry_s3(lambda: s3.delete_object(Bucket=bucket, Key=temp_key))
 
 
 def read_collector_state():
     def op():
-        obj = s3.get_object(Bucket=BUCKET, Key=COLLECTOR_STATE_KEY)
-        data = json.loads(obj["Body"].read().decode("utf-8"))
+        s3_object = s3.get_object(Bucket=BUCKET, Key=COLLECTOR_STATE_KEY)
+        data = json.loads(s3_object["Body"].read().decode("utf-8"))
         return datetime.strptime(data[LAST_ADDED_KEY], "%Y-%m-%d").date()
-    
+
     try:
         return retry_s3(op)
     except ClientError as e:
@@ -289,8 +292,8 @@ def read_collector_state():
 
 def read_preproc_state() -> date:
     def op():
-        obj = s3.get_object(Bucket=BUCKET, Key=PREPROC_STATE_KEY)
-        data = json.loads(obj["Body"].read().decode("utf-8"))
+        s3_object = s3.get_object(Bucket=BUCKET, Key=PREPROC_STATE_KEY)
+        data = json.loads(s3_object["Body"].read().decode("utf-8"))
         return datetime.strptime(data[LAST_PROCESSED_KEY], "%Y-%m-%d").date()
 
     try:
@@ -299,13 +302,13 @@ def read_preproc_state() -> date:
         return datetime.strptime(START_DATE, "%Y-%m-%d").date() - ONE_DAY
 
 
-def write_preproc_state(date_obj):
+def write_preproc_state(last_processed: date):
     def op():
-        payload = {LAST_PROCESSED_KEY: date_obj.strftime("%Y-%m-%d")}
+        payload = {LAST_PROCESSED_KEY: last_processed.strftime("%Y-%m-%d")}
         s3.put_object(
             Bucket=BUCKET,
             Key=PREPROC_STATE_KEY,
-            Body=json.dumps(payload).encode("utf-8")
+            Body=json.dumps(payload).encode("utf-8"),
         )
 
     retry_s3(op)
@@ -336,11 +339,11 @@ def clean_text(text: str) -> str:
 
         # Keep: letters, digits, punctuation, currency symbols, whitespace
         if (
-            cat.startswith("L") or   # Letters
-            cat.startswith("N") or   # Numbers
-            cat.startswith("P") or   # Punctuation
-            cat == "Sc" or           # Currency symbol
-            ch.isspace()
+            cat.startswith("L")  # Letters
+            or cat.startswith("N")  # Numbers
+            or cat.startswith("P")  # Punctuation
+            or cat == "Sc"  # Currency symbol
+            or ch.isspace()
         ):
             clean_chars.append(ch)
 
@@ -350,16 +353,25 @@ def clean_text(text: str) -> str:
 
 
 @torch.no_grad()
-def analyze_sentiment(batch):
+def analyze_sentiment(texts):
     tokenizer = get_tokenizer()
-    encodings  = tokenizer(batch,  padding=True, truncation=True, max_length=TOKENIZER_MAX_LENGTH, return_tensors="pt")
+    encodings = tokenizer(
+        texts,
+        padding=True,
+        truncation=True,
+        max_length=TOKENIZER_MAX_LENGTH,
+        return_tensors="pt",
+    )
+    token_counts = (
+        (encodings["attention_mask"] == 1).sum(dim=1).cpu().numpy().astype(np.int32)
+    )
     device = get_device()
     encodings = {k: v.to(device) for k, v in encodings.items()}
     model = get_model()
     outputs = model(**encodings)
     probs = torch.nn.functional.softmax(outputs.logits, dim=-1).cpu()
     scores = (probs[:, 2] - probs[:, 0]).tolist()
-    return scores
+    return scores, token_counts
 
 
 def detect_available_memory_mb() -> int:
@@ -393,7 +405,7 @@ def choose_batch_size():
     elif mem >= 500:
         return 8
     else:
-        return 4     
+        return 4
 
 
 def fast_skew(x):
@@ -422,8 +434,8 @@ def fast_kurtosis(x):
     return np.mean(((arr - m) / s) ** 4) - 3
 
 
-def get_sentiment(local_date: date):
-    date_str = local_date.strftime("%Y-%m-%d")
+def get_sentiment(pa_date: pa.Date32Scalar) -> pa.Table:
+    date_str = pa_date.as_py().isoformat()
     raw_key = f"{RAW_PREFIX}{date_str}/data.parquet"
     sentiment_key = f"{SENTIMENT_PREFIX}{date_str}/data.parquet"
 
@@ -434,7 +446,7 @@ def get_sentiment(local_date: date):
             raise
 
     try:
-        df = read_parquet_s3(BUCKET, raw_key, RAW_SCHEMA)
+        raw_table = read_parquet_s3(BUCKET, raw_key, RAW_SCHEMA)
     except ClientError as e:
         if e.response.get("Error", {}).get("Code", "") == "NoSuchKey":
             # IMPORTANT: If raw parquet is missing or empty, DO NOT create sentiment/aggregated files.
@@ -442,139 +454,218 @@ def get_sentiment(local_date: date):
             return None
         raise
 
-    if df is None or df.empty:
+    row_count = raw_table.num_rows
+    if row_count == 0:
         return None
 
-    df["title_clean"] = df["title"].fillna("").map(clean_text)
-    df["body_clean"] = df["body"].fillna("").map(clean_text)
-    df["text_clean"] = df["title_clean"] + " " + df["body_clean"]
+    titles = raw_table["title"]
+    bodies = raw_table["body"]
+
+    cleaned_texts = []
+    for i in range(row_count):
+        title = titles[i].as_py() or ""
+        body = bodies[i].as_py() or ""
+        text = f"{title} {body}"
+        cleaned_text = clean_text(text)
+        cleaned_texts.append(cleaned_text)
 
     batch_size = choose_batch_size()
-
     sentiment_scores = []
+    token_counts = []
 
-    for i in range(0, len(df), batch_size):
-        batch  = df["text_clean"].iloc[i : i + batch_size].tolist()
-        batch_scores  = analyze_sentiment(batch)
+    for i in range(0, row_count, batch_size):
+        batch_texts = cleaned_texts[i : i + batch_size]
+        batch_scores, batch_token_counts = analyze_sentiment(batch_texts)
+
+        if len(batch_scores) != len(batch_texts):
+            raise ValueError(
+                f"Batch sentiment mismatch for {pa_date}: expected {len(batch_texts)}, got {len(batch_scores)}"
+            )
+
+        if len(batch_token_counts) != len(batch_texts):
+            raise ValueError(
+                f"Batch sentiment mismatch for {pa_date}: expected {len(batch_texts)}, got {len(batch_token_counts)}"
+            )
+
         sentiment_scores.extend(batch_scores)
+        token_counts.extend(batch_token_counts)
 
-    df["sentiment_score"] = sentiment_scores
-    df["is_positive"] = df["sentiment_score"] > 0
-    df["is_negative"] = df["sentiment_score"] < 0
-    df["is_neutral"]  = df["sentiment_score"].abs() < 0.1
-    df["is_extreme"]  = df["sentiment_score"].abs() > 0.5
-    df["text_length"] = df["text_clean"].str.len().fillna(0).astype("int32")
+    if len(sentiment_scores) != row_count:
+        raise ValueError(
+            f"Total sentiment mismatch for {pa_date}: expected {row_count}, got {len(sentiment_scores)}"
+        )
 
-    write_parquet_s3(df, BUCKET, sentiment_key, SENTIMENT_SCHEMA)
-    return df
+    local_date_arr = pa.repeat(pa_date, row_count)
+    id_arr = raw_table["id"]
+    sentiment_scores_arr = pa.array(
+        np.asarray(sentiment_scores, dtype=np.float32), pa.float32()
+    )
+    text_length_arr = pa.array(
+        np.fromiter(
+            (len(s) for s in cleaned_texts), dtype=np.int32, count=len(cleaned_texts)
+        ),
+        pa.int32(),
+    )
+    token_count_arr = pa.array(np.asarray(token_counts, dtype=np.int32), pa.int32())
+
+    table = pa.Table.from_arrays(
+        [
+            local_date_arr,
+            id_arr,
+            sentiment_scores_arr,
+            text_length_arr,
+            token_count_arr,
+        ],
+        names=SENTIMENT_SCHEMA.names,
+    )
+
+    write_parquet_s3(table, BUCKET, sentiment_key, SENTIMENT_SCHEMA)
+    return table
 
 
-def get_aggregated(local_date: date):
-    date_str = local_date.strftime("%Y-%m-%d")
-    aggregated_key = f"{AGGREGATED_PREFIX}{date_str}/data.parquet"
+def get_aggregated(py_date: date) -> pa.Table:
+    aggregated_key = f"{AGGREGATED_PREFIX}{py_date.isoformat()}/data.parquet"
 
     try:
-        result = read_parquet_s3(BUCKET, aggregated_key, AGGREGATED_SCHEMA)
+        agg_table = read_parquet_s3(BUCKET, aggregated_key, AGGREGATED_SCHEMA)
     except ClientError as e:
         if e.response.get("Error", {}).get("Code", "") != "NoSuchKey":
             raise
 
-        df = get_sentiment(local_date)
-        if df is None:
-            result = pd.DataFrame({
-                "localDate": [date_str],
-                "count_articles": [0],
-                "mean_sentiment": [0.0],
-                "median_sentiment": [0.0],
-                "pct_positive": [0.0],
-                "pct_negative": [0.0],
-                "polarity_ratio": [0.0],
-                "weighted_mean_sentiment": [0.0],
-                "extreme_sentiment_share": [0.0],
-                "sentiment_skewness": [0.0],
-                "sentiment_kurtosis": [0.0],
-                "neutral_share": [0.0],
-                "max_sentiment": [0.0],
-                "min_sentiment": [0.0],
-                "article_length_variance": [0.0],
-                "ratio_pos_neg": [0.0],
-                "conflict_share": [0.0],
-            })
-        else:
-            result = pd.DataFrame({
-                "localDate": [date_str],
-                "count_articles": [len(df)],
-                "mean_sentiment": [df["sentiment_score"].mean()],
-                "median_sentiment": [df["sentiment_score"].median()],
-                "pct_positive": [(df["is_positive"].mean())],
-                "pct_negative": [(df["is_negative"].mean())],
-                "polarity_ratio": [(df["is_positive"].mean() - df["is_negative"].mean())],
-                "weighted_mean_sentiment": [
-                    (df["sentiment_score"] * df["text_length"]).sum() /
-                    (df["text_length"].sum() + 1e-9)
-                ],
-                "extreme_sentiment_share": [df["is_extreme"].mean()],
-                "sentiment_skewness": [fast_skew(df["sentiment_score"].values)],
-                "sentiment_kurtosis": [fast_kurtosis(df["sentiment_score"].values)],
-                "neutral_share": [df["is_neutral"].mean()],
-                "max_sentiment": [df["sentiment_score"].max()],
-                "min_sentiment": [df["sentiment_score"].min()],
-                "article_length_variance": [df["text_length"].var(ddof=0)],
-                "ratio_pos_neg": [
-                    (df["is_positive"].mean()) /
-                    (df["is_negative"].mean() + 1e-9)
-                ],
-                "conflict_share": [  # A "conflict" is defined as mild sentiment: abs(score) in [0.05, 0.15]
-                    (df["sentiment_score"].abs().between(0.05, 0.15)).mean()
-                ],
-            })
-            write_parquet_s3(result, BUCKET, aggregated_key, AGGREGATED_SCHEMA)
+        pa_date: pa.Date32Scalar = pa.scalar(py_date, type=pa.date32())
+        sentiment_table = get_sentiment(pa_date)
+        if sentiment_table is None or sentiment_table.num_rows == 0:
+            agg_table = pa.Table.from_arrays(
+                [pa.repeat(pa_date, 1)]
+                + [EMPTY_AGG_VALUES[name] for name in AGGREGATED_COLUMNS],
+                schema=AGGREGATED_SCHEMA,
+            )
 
-    if result is None:
+        else:
+            scores = sentiment_table["sentiment_score"].to_numpy()
+            scores_abs = np.abs(scores)
+            is_positive = scores > 0
+            is_negative = scores < 0
+            is_neutral = scores_abs < NEUTRAL_THRESHOLD
+            is_extreme = scores_abs > EXTREME_THRESHOLD
+            text_lengths = sentiment_table["text_length"].to_numpy()
+
+            count_articles = int(scores.size)
+
+            mean_sentiment = np.float32(scores.mean())
+            median_sentiment = np.float32(np.median(scores))
+
+            pct_positive = np.float32(is_positive.mean())
+            pct_negative = np.float32(is_negative.mean())
+            polarity_ratio = np.float32(pct_positive - pct_negative)
+
+            weighted_mean_sentiment = np.float32(
+                (scores * text_lengths).sum()
+                / (text_lengths.sum() + PREVENT_DIV_BY_ZERO)
+            )
+
+            extreme_sentiment_share = np.float32(is_extreme.mean())
+            neutral_share = np.float32(is_neutral.mean())
+
+            sentiment_skewness = np.float32(fast_skew(scores))
+            sentiment_kurtosis = np.float32(fast_kurtosis(scores))
+
+            max_sentiment = np.float32(scores.max())
+            min_sentiment = np.float32(scores.min())
+
+            article_length_variance = np.float32(text_lengths.var())
+
+            ratio_pos_neg = np.float32(
+                pct_positive / (is_negative.mean() + PREVENT_DIV_BY_ZERO)
+            )
+
+            conflict_mask = (scores_abs >= CONFLICT_THRESHOLD_LOW) & (
+                scores_abs <= CONFLICT_THRESHOLD_HIGH
+            )
+            conflict_share = np.float32(conflict_mask.mean())
+
+            agg_table = pa.Table.from_arrays(
+                [
+                    pa.repeat(pa_date, 1),
+                    pa.array([count_articles], pa.int32()),
+                    pa.array([mean_sentiment], pa.float32()),
+                    pa.array([median_sentiment], pa.float32()),
+                    pa.array([pct_positive], pa.float32()),
+                    pa.array([pct_negative], pa.float32()),
+                    pa.array([polarity_ratio], pa.float32()),
+                    pa.array([weighted_mean_sentiment], pa.float32()),
+                    pa.array([extreme_sentiment_share], pa.float32()),
+                    pa.array([sentiment_skewness], pa.float32()),
+                    pa.array([sentiment_kurtosis], pa.float32()),
+                    pa.array([neutral_share], pa.float32()),
+                    pa.array([max_sentiment], pa.float32()),
+                    pa.array([min_sentiment], pa.float32()),
+                    pa.array([article_length_variance], pa.float32()),
+                    pa.array([ratio_pos_neg], pa.float32()),
+                    pa.array([conflict_share], pa.float32()),
+                ],
+                schema=AGGREGATED_SCHEMA,
+            )
+
+            write_parquet_s3(agg_table, BUCKET, aggregated_key, AGGREGATED_SCHEMA)
+
+    if agg_table is None:
         raise ValueError("Unexpected None result in get_aggregated()")
 
-    if len(result) != 1:
-        raise ValueError(f"Aggregated result for {local_date} has {len(result)} rows, expected 1")
-    
-    return result
+    if agg_table.num_rows != 1:
+        raise ValueError(
+            f"Aggregated result for {py_date} has {agg_table.num_rows} rows, expected 1"
+        )
+
+    return agg_table
 
 
 def continue_execution(context=None):
-    if context is not None and int(context.get_remaining_time_in_millis()) < MIN_REMAINING_MS:
+    if (
+        context is not None
+        and int(context.get_remaining_time_in_millis()) < MIN_REMAINING_MS
+    ):
         logger.warning(f"Stopping execution due to timeout limit.")
         return False
-    
+
     return True
 
 
-def build_row(current, window):
-    row = {"localDate": current.strftime("%Y-%m-%d")}
-    for i, agg in enumerate(window):
-        lag = LAG_DAYS - i
+def append_lag_row(builders: dict, py_date: date, window: deque):
+    builders["localDate"].append(pa.scalar(py_date, type=pa.date32()))
+    lag = LAG_DAYS
+
+    for agg_table in window:
         for col in AGGREGATED_COLUMNS:
-            row[f"{col}-{lag}"] = float(agg[col].iloc[0])
-    return row
+            value = agg_table[col][0]
+            builders[f"{col}-{lag}"].append(value)
+        lag -= 1
 
 
 def generate_lagged_features(context=None):
-    try:    
+    try:
         last_added = read_collector_state()
         if last_added is None:
             return {"statusCode": 200, "body": "no raw data to process"}
 
-        last_done = read_preproc_state()
-        if last_done > last_added:
+        last_processed = read_preproc_state()
+        if last_processed > last_added:
             return {"statusCode": 200, "body": "all data already processed"}
 
-        current = last_done + ONE_DAY
+        current = last_processed + ONE_DAY
 
         rolling_window = deque(maxlen=LAG_DAYS)
         for i in range(LAG_DAYS, 1, -1):
             lag_date = current - timedelta(days=i)
-            agg = get_aggregated(lag_date)
-            rolling_window.append(agg)
+            agg_table = get_aggregated(lag_date)
+            rolling_window.append(agg_table)
 
-        lagged_rows = []
+        builders = {
+            field.name: field.type._default_array_type().builder()
+            for field in LAGGED_SCHEMA
+        }
+
+        rows_written = 0
 
         while continue_execution(context):
             prev = current - ONE_DAY
@@ -582,28 +673,32 @@ def generate_lagged_features(context=None):
                 break
 
             rolling_window.append(get_aggregated(prev))
-
-            row = build_row(current, rolling_window)
-            lagged_rows.append(row)
-            last_done = current
+            append_lag_row(builders, current, rolling_window)
+            rows_written += 1
+            last_processed = current
             logger.info(f"Computed lagged features for {current}")
             current += ONE_DAY
 
-        # If nothing was computed → exit cleanly
-        if not lagged_rows:
-            return {"statusCode": 200, "body": "no lagged features computed due to lambda timeout"}
+        if rows_written == 0:
+            return {
+                "statusCode": 200,
+                "body": "no lagged features computed due to lambda timeout",
+            }
 
-        # Write one new parquet chunk for this invocation
-        lagged_df = pd.DataFrame(lagged_rows)
-        timestamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')
+        arrays = [builders[f.name].finish() for f in LAGGED_SCHEMA]
+        lagged_table = pa.Table.from_arrays(arrays, schema=LAGGED_SCHEMA)
+
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
         file_name = f"{timestamp}.parquet"
         lagged_key = f"{LAGGED_PREFIX}{file_name}"
-        write_parquet_s3(lagged_df, BUCKET, lagged_key, LAGGED_SCHEMA)
+        write_parquet_s3(lagged_table, BUCKET, lagged_key, LAGGED_SCHEMA)
 
-        # Update checkpoint atomically
-        write_preproc_state(last_done)
+        write_preproc_state(last_processed)
 
-        return {"statusCode": 200, "body": f"finished preprocessing up to and including {last_done:%Y-%m-%d}"}
+        return {
+            "statusCode": 200,
+            "body": f"finished preprocessing up to and including {last_processed:%Y-%m-%d}",
+        }
     except Exception:
         logger.exception("Error in generate_lagged_features")
         return {"statusCode": 500, "body": "error"}
