@@ -1,20 +1,23 @@
-from collections import deque
+# ---------- STANDARD LIBRARY ----------
 import json
 import logging
 import os
-from typing import cast
-import unicodedata
-import time
 import random
-from botocore.exceptions import ClientError
-from io import BytesIO
+import time
+import unicodedata
+from collections import deque
 from datetime import date, datetime, timedelta, timezone
+from io import BytesIO
+from typing import cast
+
+# ---------- THIRD-PARTY LIBRARIES ----------
 import boto3
 import numpy as np
-import pyarrow.parquet as pq
 import pyarrow as pa
+import pyarrow.parquet as pq
 import torch
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from botocore.exceptions import ClientError
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 # ---------- CONFIG ----------
 BUCKET = os.environ.get("BUCKET", "dev-rkoch-spre")
@@ -671,7 +674,7 @@ def generate_lagged_features(context=None):
         rows_written = 0
 
         while continue_execution(context):
-            if rows_written == 10:
+            if rows_written == 1:
                 break
 
             prev = current - ONE_DAY
@@ -681,7 +684,6 @@ def generate_lagged_features(context=None):
             rolling_window.append(get_aggregated(prev))
             append_lagged_row(lagged_columns, current, rolling_window)
             rows_written += 1
-            last_processed = current
             logger.info(f"Computed lagged features for {current}")
             current += ONE_DAY
 
@@ -692,7 +694,8 @@ def generate_lagged_features(context=None):
             }
 
         arrays = [
-            pa.array(lagged_columns[field.name], type=field.type) for field in LAGGED_SCHEMA
+            pa.array(lagged_columns[field.name], type=field.type)
+            for field in LAGGED_SCHEMA
         ]
         lagged_table = pa.Table.from_arrays(arrays, schema=LAGGED_SCHEMA)
 
@@ -701,11 +704,12 @@ def generate_lagged_features(context=None):
         lagged_key = f"{LAGGED_PREFIX}{file_name}"
         write_parquet_s3(lagged_table, BUCKET, lagged_key, LAGGED_SCHEMA)
 
-        write_preproc_state(last_processed)
+        new_last_processed = lagged_table["localDate"].to_pylist()[-1]
+        write_preproc_state(new_last_processed)
 
         return {
             "statusCode": 200,
-            "body": f"finished preprocessing up to and including {last_processed:%Y-%m-%d}",
+            "body": f"finished preprocessing up to and including {new_last_processed:%Y-%m-%d}",
         }
     except Exception:
         logger.exception("Error in generate_lagged_features")
