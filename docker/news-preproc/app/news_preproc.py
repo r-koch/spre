@@ -24,13 +24,16 @@ BUCKET = os.environ.get("BUCKET", "dev-rkoch-spre")
 REGION = os.environ.get("AWS_REGION", "eu-west-1")
 LAG_DAYS = int(os.environ.get("LAG_DAYS", "5"))
 START_DATE = os.environ.get("START_DATE", "1999-11-01")
-MIN_REMAINING_MS = int(os.environ.get("MIN_REMAINING_MS", "60000"))
+MIN_REMAINING_MS = int(os.environ.get("MIN_REMAINING_MS", "180000"))
 MODEL_NAME_OR_DIR = os.environ.get(
     "MODEL_DIR", "ProsusAI/finbert"
 )  # locally use model name, in docker use env
 RETRY_COUNT = int(os.environ.get("RETRY_COUNT", "3"))
 RETRY_DELAY_S = float(os.environ.get("RETRY_DELAY_S", "0.25"))
 RETRY_MAX_DELAY_S = float(os.environ.get("RETRY_MAX_DELAY_S", "2.0"))
+DEBUG_MAX_DAYS_PER_INVOCATION = int(
+    os.environ.get("DEBUG_MAX_DAYS_PER_INVOCATION", "2")
+)
 
 CONFLICT_THRESHOLD_LOW = np.float32(0.05)
 CONFLICT_THRESHOLD_HIGH = np.float32(0.15)
@@ -671,10 +674,10 @@ def generate_lagged_features(context=None):
 
         lagged_columns = {field.name: [] for field in LAGGED_SCHEMA}
 
-        rows_written = 0
+        days_processed = 0
 
         while continue_execution(context):
-            if rows_written == 1:
+            if days_processed == DEBUG_MAX_DAYS_PER_INVOCATION:
                 break
 
             prev = current - ONE_DAY
@@ -683,11 +686,11 @@ def generate_lagged_features(context=None):
 
             rolling_window.append(get_aggregated(prev))
             append_lagged_row(lagged_columns, current, rolling_window)
-            rows_written += 1
+            days_processed += 1
             logger.info(f"Computed lagged features for {current}")
             current += ONE_DAY
 
-        if rows_written == 0:
+        if days_processed == 0:
             return {
                 "statusCode": 200,
                 "body": "no lagged features computed due to lambda timeout",
