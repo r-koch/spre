@@ -11,7 +11,8 @@ RUN yum install -y git && yum clean all
 RUN pip install --upgrade pip setuptools wheel
 
 # Copy application files
-COPY app/* ${LAMBDA_TASK_ROOT}/
+WORKDIR ${LAMBDA_TASK_ROOT}
+COPY app/* .
 COPY requirements.txt .
 
 # Install Python dependencies (with pinned versions)
