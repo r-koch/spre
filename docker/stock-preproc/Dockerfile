@@ -9,11 +9,12 @@ RUN pip install --upgrade pip setuptools wheel
 
 # Copy application files
 WORKDIR ${LAMBDA_TASK_ROOT}
-COPY app/* .
-COPY requirements.txt .
+COPY python/stock_preproc.py .
+COPY python/shared.py .
+COPY docker/stock-preproc/requirements.txt .
 
 # Install Python dependencies (with pinned versions)
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Set Lambda handler
-CMD ["main.lambda_handler"]
+CMD ["stock_preproc.lambda_handler"]

@@ -179,6 +179,10 @@ def generate_pivoted_features(context=None):
         return {"statusCode": 500, "body": "error"}
 
 
+def lambda_handler(event=None, context=None):
+    return generate_pivoted_features(context)
+
+
 # ---------- ENTRY POINT ----------
 if __name__ == "__main__":
     generate_pivoted_features()
