@@ -15,8 +15,9 @@ import pyarrow.parquet as pq
 from botocore.exceptions import ClientError
 
 # ---------- CONFIG ----------
+DEFAULT_MIN_REMAINING_MS = 60_000
+
 AWS_REGION = os.getenv("AWS_REGION", "eu-west-1")
-MIN_REMAINING_MS = int(os.getenv("MIN_REMAINING_MS", "60000"))
 RETRY_COUNT = int(os.getenv("RETRY_COUNT", "3"))
 RETRY_DELAY_S = float(os.getenv("RETRY_DELAY_S", "0.25"))
 RETRY_MAX_DELAY_S = float(os.getenv("RETRY_MAX_DELAY_S", "2.0"))
@@ -47,7 +48,22 @@ def setup_logger():
     return logger
 
 
-# ---------- S3 UTILS ----------
+# ---------- LAMBDA ----------
+def continue_execution(
+    context=None, min_remaining_ms=DEFAULT_MIN_REMAINING_MS, logger=None
+):
+    if (
+        context is not None
+        and int(context.get_remaining_time_in_millis()) < min_remaining_ms
+    ):
+        if logger:
+            logger.warning(f"Stopping execution due to timeout limit.")
+        return False
+
+    return True
+
+
+# ---------- S3 READ/WRITE ----------
 def retry_s3(
     operation,
     retry_count=RETRY_COUNT,
