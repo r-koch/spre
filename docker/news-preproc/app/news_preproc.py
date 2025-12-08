@@ -20,20 +20,18 @@ from botocore.exceptions import ClientError
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 # ---------- CONFIG ----------
-BUCKET = os.environ.get("BUCKET", "dev-rkoch-spre")
-REGION = os.environ.get("AWS_REGION", "eu-west-1")
-LAG_DAYS = int(os.environ.get("LAG_DAYS", "5"))
-START_DATE = os.environ.get("START_DATE", "1999-11-01")
-MIN_REMAINING_MS = int(os.environ.get("MIN_REMAINING_MS", "180000"))
-MODEL_NAME_OR_DIR = os.environ.get(
+BUCKET = os.getenv("BUCKET", "dev-rkoch-spre")
+REGION = os.getenv("AWS_REGION", "eu-west-1")
+LAG_DAYS = int(os.getenv("LAG_DAYS", "5"))
+START_DATE = os.getenv("START_DATE", "1999-11-01")
+MIN_REMAINING_MS = int(os.getenv("MIN_REMAINING_MS", "240000"))
+MODEL_NAME_OR_DIR = os.getenv(
     "MODEL_DIR", "ProsusAI/finbert"
 )  # locally use model name, in docker use env
-RETRY_COUNT = int(os.environ.get("RETRY_COUNT", "3"))
-RETRY_DELAY_S = float(os.environ.get("RETRY_DELAY_S", "0.25"))
-RETRY_MAX_DELAY_S = float(os.environ.get("RETRY_MAX_DELAY_S", "2.0"))
-DEBUG_MAX_DAYS_PER_INVOCATION = int(
-    os.environ.get("DEBUG_MAX_DAYS_PER_INVOCATION", "2")
-)
+RETRY_COUNT = int(os.getenv("RETRY_COUNT", "3"))
+RETRY_DELAY_S = float(os.getenv("RETRY_DELAY_S", "0.25"))
+RETRY_MAX_DELAY_S = float(os.getenv("RETRY_MAX_DELAY_S", "2.0"))
+DEBUG_MAX_DAYS_PER_INVOCATION = int(os.getenv("DEBUG_MAX_DAYS_PER_INVOCATION", "2"))
 
 CONFLICT_THRESHOLD_LOW = np.float32(0.05)
 CONFLICT_THRESHOLD_HIGH = np.float32(0.15)
@@ -47,8 +45,8 @@ META_DATA = "metadata/"
 COLLECTOR_STATE_KEY = f"{META_DATA}news_collector_state.json"
 PREPROC_STATE_KEY = f"{META_DATA}news_preproc_state.json"
 
-LAST_PROCESSED_KEY = "lastProcessed"
 LAST_ADDED_KEY = "lastAdded"
+LAST_PROCESSED_KEY = "lastProcessed"
 
 TEMP_PREFIX = "tmp/"
 RAW_PREFIX = "raw/news/localDate="
@@ -61,6 +59,30 @@ s3 = boto3.client("s3", region_name=REGION)
 if "MODEL_DIR" in os.environ:
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
+
+
+# ---------- LOGGING CONFIG ----------
+def setup_logger():
+    logger = logging.getLogger(__name__)
+    if logger.hasHandlers():
+        logger.handlers.clear()
+
+    handler = logging.StreamHandler()
+    if "AWS_LAMBDA_FUNCTION_NAME" in os.environ:
+        formatter = logging.Formatter("[%(levelname)s] %(message)s")
+        logger.setLevel(logging.INFO)
+    else:
+        formatter = logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s:%(lineno)d - %(message)s"
+        )
+        logger.setLevel(logging.DEBUG)
+
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    return logger
+
+
+logger = setup_logger()
 
 # ---------- SCHEMAS ----------
 
@@ -138,29 +160,6 @@ EMPTY_AGG_VALUES = {
     "conflict_share": pa.array([0.0], pa.float32()),
 }
 
-
-# ---------- LOGGING CONFIG ----------
-def setup_logger():
-    logger = logging.getLogger(__name__)
-    if logger.hasHandlers():
-        logger.handlers.clear()
-
-    handler = logging.StreamHandler()
-    if "AWS_LAMBDA_FUNCTION_NAME" in os.environ:
-        formatter = logging.Formatter("[%(levelname)s] %(message)s")
-        logger.setLevel(logging.INFO)
-    else:
-        formatter = logging.Formatter(
-            "%(asctime)s [%(levelname)s] %(name)s:%(lineno)d - %(message)s"
-        )
-        logger.setLevel(logging.DEBUG)
-
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-    return logger
-
-
-logger = setup_logger()
 
 # ---------- MODEL (Lazy Loaded) ----------
 tokenizer = None
@@ -262,7 +261,7 @@ def read_parquet_s3(bucket: str, key: str, schema: pa.Schema) -> pa.Table:
     return retry_s3(op)
 
 
-def write_parquet_s3(table, bucket, key, schema):
+def write_parquet_s3(table: pa.Table, bucket: str, key: str, schema: pa.Schema):
     if table is None:
         raise ValueError("table must not be None for write_parquet_s3")
 
@@ -288,7 +287,7 @@ def write_parquet_s3(table, bucket, key, schema):
     retry_s3(lambda: s3.delete_object(Bucket=bucket, Key=temp_key))
 
 
-def read_collector_state():
+def read_collector_state() -> date | None:
     def op():
         s3_object = s3.get_object(Bucket=BUCKET, Key=COLLECTOR_STATE_KEY)
         data = json.loads(s3_object["Body"].read().decode("utf-8"))
@@ -387,7 +386,7 @@ def analyze_sentiment(texts):
 
 
 def detect_available_memory_mb() -> int:
-    mem_env = os.environ.get("AWS_LAMBDA_FUNCTION_MEMORY_SIZE")
+    mem_env = os.getenv("AWS_LAMBDA_FUNCTION_MEMORY_SIZE")
     if mem_env:
         return int(mem_env)
 
