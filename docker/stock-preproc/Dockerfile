@@ -1,8 +1,8 @@
 # Base image — slim, Lambda-compatible
-FROM public.ecr.aws/lambda/python:3.11
+FROM public.ecr.aws/lambda/python:3.14
 
 # Install minimal system dependencies
-RUN yum install -y git && yum clean all
+RUN dnf install -y git && dnf clean all
 
 # Upgrade pip, setuptools, wheel to avoid build issues
 RUN pip install --upgrade pip setuptools wheel
