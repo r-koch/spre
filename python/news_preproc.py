@@ -1,20 +1,14 @@
 # ---------- STANDARD LIBRARY ----------
-import json
-import logging
+import multiprocessing
 import os
-import random
-import time
 import unicodedata
 from collections import deque
 from datetime import date, datetime, timedelta, timezone
-from io import BytesIO
-from typing import cast
 
 # ---------- THIRD-PARTY LIBRARIES ----------
-import boto3
 import numpy as np
 import pyarrow as pa
-import pyarrow.parquet as pq
+import shared as s
 import torch
 from botocore.exceptions import ClientError
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
@@ -23,7 +17,7 @@ from transformers import AutoModelForSequenceClassification, AutoTokenizer
 BUCKET = os.getenv("BUCKET", "dev-rkoch-spre")
 REGION = os.getenv("AWS_REGION", "eu-west-1")
 LAG_DAYS = int(os.getenv("LAG_DAYS", "5"))
-START_DATE = os.getenv("START_DATE", "1999-11-01")
+START_DATE = date.fromisoformat(os.getenv("START_DATE", "1999-11-01"))
 MIN_REMAINING_MS = int(os.getenv("MIN_REMAINING_MS", "240000"))
 MODEL_NAME_OR_DIR = os.getenv(
     "MODEL_DIR", "ProsusAI/finbert"
@@ -54,35 +48,8 @@ SENTIMENT_PREFIX = "news/sentiment/localDate="
 AGGREGATED_PREFIX = "news/aggregated/localDate="
 LAGGED_PREFIX = f"news/lagged-{LAG_DAYS}/"
 
-s3 = boto3.client("s3", region_name=REGION)
+logger = s.setup_logger()
 
-if "MODEL_DIR" in os.environ:
-    torch.set_num_threads(1)
-    torch.set_num_interop_threads(1)
-
-
-# ---------- LOGGING CONFIG ----------
-def setup_logger():
-    logger = logging.getLogger(__name__)
-    if logger.hasHandlers():
-        logger.handlers.clear()
-
-    handler = logging.StreamHandler()
-    if "AWS_LAMBDA_FUNCTION_NAME" in os.environ:
-        formatter = logging.Formatter("[%(levelname)s] %(message)s")
-        logger.setLevel(logging.INFO)
-    else:
-        formatter = logging.Formatter(
-            "%(asctime)s [%(levelname)s] %(name)s:%(lineno)d - %(message)s"
-        )
-        logger.setLevel(logging.DEBUG)
-
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-    return logger
-
-
-logger = setup_logger()
 
 # ---------- SCHEMAS ----------
 
@@ -170,6 +137,12 @@ def is_docker():
     return "MODEL_DIR" in os.environ
 
 
+if is_docker:
+    vcpus = multiprocessing.cpu_count()
+    torch.set_num_threads(min(vcpus, 4))
+    torch.set_num_interop_threads(min(vcpus, 2))
+
+
 def get_tokenizer():
     global tokenizer
     if tokenizer is None:
@@ -206,135 +179,6 @@ def get_device():
     if torch.cuda.is_available():
         return torch.device("cuda")
     return torch.device("cpu")
-
-
-# ---------- HELPERS ----------
-def retry_s3(
-    operation,
-    retry_count=RETRY_COUNT,
-    retry_delay=RETRY_DELAY_S,
-    retry_max_delay=RETRY_MAX_DELAY_S,
-):
-    for attempt in range(retry_count):
-        try:
-            return operation()
-        except ClientError as e:
-            if attempt < retry_count - 1:
-                code = e.response.get("Error", {}).get("Code", "")
-                retryable = (
-                    code.startswith("5")
-                    or "Throttl" in code
-                    or code
-                    in (
-                        "SlowDown",
-                        "RequestTimeout",
-                        "RequestTimeTooSkewed",
-                        "InternalError",
-                    )
-                )
-
-                if retryable:
-                    max_sleep = min(retry_delay * (2**attempt), retry_max_delay)
-                    sleep = random.uniform(0, max_sleep)
-                    time.sleep(sleep)
-                    continue
-
-            raise  # No retry
-
-
-def read_parquet_s3(bucket: str, key: str, schema: pa.Schema) -> pa.Table:
-    def op():
-        s3_object = s3.get_object(Bucket=bucket, Key=key)
-        buffer = BytesIO(s3_object["Body"].read())
-        try:
-            table = pq.read_table(buffer, columns=schema.names)
-        except Exception as e:
-            raise ValueError(f"Corrupted parquet at {key}: {e}")
-
-        if schema_mismatch(schema, table.schema):
-            raise ValueError(
-                f"Schema mismatch for {key}. Expected {schema}, got {table.schema}"
-            )
-
-        return table
-
-    return retry_s3(op)
-
-
-def write_parquet_s3(table: pa.Table, bucket: str, key: str, schema: pa.Schema):
-    if table is None:
-        raise ValueError("table must not be None for write_parquet_s3")
-
-    if schema is None:
-        raise ValueError("Schema must not be None for write_parquet_s3")
-
-    if schema_mismatch(schema, table.schema):
-        raise ValueError(
-            f"Schema mismatch for {key}. Expected {schema}, got {table.schema}"
-        )
-
-    buffer = BytesIO()
-    pq.write_table(table, buffer, compression="zstd", compression_level=3)
-    data = buffer.getvalue()
-
-    temp_key = f"{TEMP_PREFIX}{key}"
-    retry_s3(lambda: s3.put_object(Bucket=bucket, Key=temp_key, Body=data))
-    retry_s3(
-        lambda: s3.copy_object(
-            Bucket=bucket, CopySource={"Bucket": bucket, "Key": temp_key}, Key=key
-        )
-    )
-    retry_s3(lambda: s3.delete_object(Bucket=bucket, Key=temp_key))
-
-
-def read_collector_state() -> date | None:
-    def op():
-        s3_object = s3.get_object(Bucket=BUCKET, Key=COLLECTOR_STATE_KEY)
-        data = json.loads(s3_object["Body"].read().decode("utf-8"))
-        return datetime.strptime(data[LAST_ADDED_KEY], "%Y-%m-%d").date()
-
-    try:
-        return retry_s3(op)
-    except ClientError as e:
-        if e.response.get("Error", {}).get("Code", "") == "NoSuchKey":
-            return None
-        raise
-
-
-def read_preproc_state() -> date:
-    def op():
-        s3_object = s3.get_object(Bucket=BUCKET, Key=PREPROC_STATE_KEY)
-        data = json.loads(s3_object["Body"].read().decode("utf-8"))
-        return datetime.strptime(data[LAST_PROCESSED_KEY], "%Y-%m-%d").date()
-
-    try:
-        return cast(date, retry_s3(op))
-    except ClientError:
-        return datetime.strptime(START_DATE, "%Y-%m-%d").date() - ONE_DAY
-
-
-def write_preproc_state(last_processed: date):
-    def op():
-        payload = {LAST_PROCESSED_KEY: last_processed.strftime("%Y-%m-%d")}
-        s3.put_object(
-            Bucket=BUCKET,
-            Key=PREPROC_STATE_KEY,
-            Body=json.dumps(payload).encode("utf-8"),
-        )
-
-    retry_s3(op)
-
-
-def schema_mismatch(expected: pa.Schema, actual: pa.Schema) -> bool:
-    if len(expected) != len(actual):
-        return True
-
-    for f_exp, f_act in zip(expected, actual):
-        if f_exp.name != f_act.name:
-            return True
-        if not f_exp.type.equals(f_act.type):
-            return True
-    return False
 
 
 def clean_text(text: str) -> str:
@@ -451,13 +295,13 @@ def get_sentiment(pa_date: pa.Date32Scalar) -> pa.Table:
     sentiment_key = f"{SENTIMENT_PREFIX}{date_str}/data.parquet"
 
     try:
-        return read_parquet_s3(BUCKET, sentiment_key, SENTIMENT_SCHEMA)
+        return s.read_parquet_s3(BUCKET, sentiment_key, SENTIMENT_SCHEMA)
     except ClientError as e:
         if e.response.get("Error", {}).get("Code", "") != "NoSuchKey":
             raise
 
     try:
-        raw_table = read_parquet_s3(BUCKET, raw_key, RAW_SCHEMA)
+        raw_table = s.read_parquet_s3(BUCKET, raw_key, RAW_SCHEMA)
     except ClientError as e:
         if e.response.get("Error", {}).get("Code", "") == "NoSuchKey":
             # IMPORTANT: If raw parquet is missing or empty, DO NOT create sentiment/aggregated files.
@@ -530,7 +374,7 @@ def get_sentiment(pa_date: pa.Date32Scalar) -> pa.Table:
         names=SENTIMENT_SCHEMA.names,
     )
 
-    write_parquet_s3(table, BUCKET, sentiment_key, SENTIMENT_SCHEMA)
+    s.write_parquet_s3(table, BUCKET, sentiment_key, SENTIMENT_SCHEMA)
     return table
 
 
@@ -538,7 +382,7 @@ def get_aggregated(py_date: date) -> pa.Table:
     aggregated_key = f"{AGGREGATED_PREFIX}{py_date.isoformat()}/data.parquet"
 
     try:
-        agg_table = read_parquet_s3(BUCKET, aggregated_key, AGGREGATED_SCHEMA)
+        agg_table = s.read_parquet_s3(BUCKET, aggregated_key, AGGREGATED_SCHEMA)
     except ClientError as e:
         if e.response.get("Error", {}).get("Code", "") != "NoSuchKey":
             raise
@@ -618,7 +462,7 @@ def get_aggregated(py_date: date) -> pa.Table:
                 schema=AGGREGATED_SCHEMA,
             )
 
-            write_parquet_s3(agg_table, BUCKET, aggregated_key, AGGREGATED_SCHEMA)
+            s.write_parquet_s3(agg_table, BUCKET, aggregated_key, AGGREGATED_SCHEMA)
 
     if agg_table is None:
         raise ValueError("Unexpected None result in get_aggregated()")
@@ -655,11 +499,14 @@ def append_lagged_row(lagged_columns: dict, py_date: date, window: deque):
 
 def generate_lagged_features(context=None):
     try:
-        last_added = read_collector_state()
+        last_added = s.read_json_date_s3(BUCKET, COLLECTOR_STATE_KEY, LAST_ADDED_KEY)
         if last_added is None:
             return {"statusCode": 200, "body": "no raw data to process"}
 
-        last_processed = read_preproc_state()
+        default_last_processed = START_DATE - ONE_DAY
+        last_processed = s.read_json_date_s3(
+            BUCKET, PREPROC_STATE_KEY, LAST_PROCESSED_KEY, default_last_processed
+        )
         if last_processed > last_added:
             return {"statusCode": 200, "body": "all data already processed"}
 
@@ -704,10 +551,12 @@ def generate_lagged_features(context=None):
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
         file_name = f"{timestamp}.parquet"
         lagged_key = f"{LAGGED_PREFIX}{file_name}"
-        write_parquet_s3(lagged_table, BUCKET, lagged_key, LAGGED_SCHEMA)
+        s.write_parquet_s3(lagged_table, BUCKET, lagged_key, LAGGED_SCHEMA)
 
         new_last_processed = lagged_table["localDate"].to_pylist()[-1]
-        write_preproc_state(new_last_processed)
+        s.write_json_date_s3(
+            BUCKET, PREPROC_STATE_KEY, LAST_PROCESSED_KEY, new_last_processed
+        )
 
         return {
             "statusCode": 200,
@@ -716,6 +565,10 @@ def generate_lagged_features(context=None):
     except Exception:
         logger.exception("Error in generate_lagged_features")
         return {"statusCode": 500, "body": "error"}
+
+
+def lambda_handler(event=None, context=None):
+    return generate_lagged_features(context)
 
 
 # ---------- ENTRY POINT ----------
