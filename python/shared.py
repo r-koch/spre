@@ -10,9 +10,19 @@ from typing import cast, overload
 
 # ---------- THIRD-PARTY LIBRARIES ----------
 import boto3
-import pyarrow as pa
-import pyarrow.parquet as pq
 from botocore.exceptions import ClientError
+
+# ---------- THIRD-PARTY LIBRARIES LAZY ----------
+_pq = None
+
+def pq():
+    global _pq
+    if _pq is None:
+        import pyarrow.parquet as pq
+
+        _pq = pq
+    return _pq
+
 
 # ---------- CONFIG ----------
 DEFAULT_MIN_REMAINING_MS = 60_000
@@ -21,7 +31,6 @@ AWS_REGION = os.getenv("AWS_REGION", "eu-west-1")
 RETRY_COUNT = int(os.getenv("RETRY_COUNT", "3"))
 RETRY_DELAY_S = float(os.getenv("RETRY_DELAY_S", "0.25"))
 RETRY_MAX_DELAY_S = float(os.getenv("RETRY_MAX_DELAY_S", "2.0"))
-
 
 s3 = boto3.client("s3", region_name=AWS_REGION)
 
@@ -96,12 +105,12 @@ def retry_s3(
             raise  # No retry
 
 
-def read_parquet_s3(bucket: str, key: str, schema: pa.Schema) -> pa.Table:
+def read_parquet_s3(bucket: str, key: str, schema):
     def op():
         s3_object = s3.get_object(Bucket=bucket, Key=key)
         buffer = BytesIO(s3_object["Body"].read())
         try:
-            table = pq.read_table(buffer, columns=schema.names)
+            table = pq().read_table(buffer, columns=schema.names)
         except Exception as e:
             raise ValueError(f"Corrupted parquet at {key}: {e}")
 
@@ -115,7 +124,7 @@ def read_parquet_s3(bucket: str, key: str, schema: pa.Schema) -> pa.Table:
     return retry_s3(op)
 
 
-def write_parquet_s3(table: pa.Table, bucket: str, key: str, schema: pa.Schema):
+def write_parquet_s3(table, bucket: str, key: str, schema):
     if table is None:
         raise ValueError("table must not be None for write_parquet_s3")
 
@@ -128,13 +137,13 @@ def write_parquet_s3(table: pa.Table, bucket: str, key: str, schema: pa.Schema):
         )
 
     buffer = BytesIO()
-    pq.write_table(table, buffer, compression="zstd", compression_level=1)
+    pq().write_table(table, buffer, compression="zstd", compression_level=1)
     data = buffer.getvalue()
 
     retry_s3(lambda: s3.put_object(Bucket=bucket, Key=key, Body=data))
 
 
-def schema_mismatch(expected: pa.Schema, actual: pa.Schema) -> bool:
+def schema_mismatch(expected, actual) -> bool:
     if len(expected) != len(actual):
         return True
 
