@@ -1,5 +1,4 @@
 # ---------- STANDARD LIBRARY ----------
-import multiprocessing
 import os
 import unicodedata
 from collections import deque
@@ -8,6 +7,7 @@ from datetime import date, datetime, timedelta, timezone
 # ---------- THIRD-PARTY LIBRARIES ----------
 import numpy as np
 import pyarrow as pa
+import regex as re
 import shared as s
 import torch
 from botocore.exceptions import ClientError
@@ -19,7 +19,7 @@ REGION = os.getenv("AWS_REGION", "eu-west-1")
 LAG_DAYS = int(os.getenv("LAG_DAYS", "5"))
 START_DATE = date.fromisoformat(os.getenv("START_DATE", "1999-11-01"))
 MIN_REMAINING_MS = int(os.getenv("MIN_REMAINING_MS", "240000"))
-MODEL_NAME_OR_DIR = os.getenv(
+MODEL_DIR_OR_NAME = os.getenv(
     "MODEL_DIR", "ProsusAI/finbert"
 )  # locally use model name, in docker use env
 RETRY_COUNT = int(os.getenv("RETRY_COUNT", "3"))
@@ -48,8 +48,44 @@ SENTIMENT_PREFIX = "news/sentiment/localDate="
 AGGREGATED_PREFIX = "news/aggregated/localDate="
 LAGGED_PREFIX = f"news/lagged-{LAG_DAYS}/"
 
-logger = s.setup_logger()
+LOGGER = s.setup_logger()
 
+ALLOWED_REGEX_PATTERN = re.compile(r"[A-Za-z0-9\p{P}\p{Sc}\s]+")
+
+
+def get_available_memory_mb() -> int:
+    memory_mb = os.getenv("AWS_LAMBDA_FUNCTION_MEMORY_SIZE")
+    if memory_mb:
+        return int(memory_mb)
+
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) // 1024
+    except Exception:
+        pass
+
+    return 1024
+
+
+def get_batch_size() -> int:
+    mem = get_available_memory_mb()
+    if mem >= 3000:
+        return 48
+    elif mem >= 2000:
+        return 32
+    elif mem >= 1500:
+        return 24
+    elif mem >= 1000:
+        return 16
+    elif mem >= 500:
+        return 8
+    else:
+        return 4
+
+
+BATCH_SIZE = get_batch_size()
 
 # ---------- SCHEMAS ----------
 
@@ -108,46 +144,34 @@ def build_lagged_schema():
 
 LAGGED_SCHEMA = build_lagged_schema()
 
-EMPTY_AGG_VALUES = {
-    "count_articles": pa.array([0], pa.int32()),
-    "mean_sentiment": pa.array([0.0], pa.float32()),
-    "median_sentiment": pa.array([0.0], pa.float32()),
-    "pct_positive": pa.array([0.0], pa.float32()),
-    "pct_negative": pa.array([0.0], pa.float32()),
-    "polarity_ratio": pa.array([0.0], pa.float32()),
-    "weighted_mean_sentiment": pa.array([0.0], pa.float32()),
-    "extreme_sentiment_share": pa.array([0.0], pa.float32()),
-    "sentiment_skewness": pa.array([0.0], pa.float32()),
-    "sentiment_kurtosis": pa.array([0.0], pa.float32()),
-    "neutral_share": pa.array([0.0], pa.float32()),
-    "max_sentiment": pa.array([0.0], pa.float32()),
-    "min_sentiment": pa.array([0.0], pa.float32()),
-    "article_length_variance": pa.array([0.0], pa.float32()),
-    "ratio_pos_neg": pa.array([0.0], pa.float32()),
-    "conflict_share": pa.array([0.0], pa.float32()),
+EMPTY_AGGREGATED_DICT = {
+    column_name: 0 if column_name == "count_articles" else 0.0
+    for column_name in AGGREGATED_COLUMNS
 }
 
 
 # ---------- MODEL (Lazy Loaded) ----------
-tokenizer = None
-model = None
+LOCAL_FILES_ONLY = "MODEL_DIR" in os.environ
+DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+CPU_ONLY = DEVICE.type == "cpu"
 
 
-def is_docker():
-    return "MODEL_DIR" in os.environ
-
-
-if is_docker:
-    vcpus = multiprocessing.cpu_count()
+if CPU_ONLY:
+    vcpus = os.cpu_count() or 1
+    LOGGER.info(f"vcpu count: {vcpus}")
     torch.set_num_threads(min(vcpus, 4))
     torch.set_num_interop_threads(min(vcpus, 2))
+
+
+tokenizer = None
+model = None
 
 
 def get_tokenizer():
     global tokenizer
     if tokenizer is None:
         tokenizer = AutoTokenizer.from_pretrained(
-            MODEL_NAME_OR_DIR, local_files_only=is_docker()
+            MODEL_DIR_OR_NAME, local_files_only=LOCAL_FILES_ONLY
         )
     return tokenizer
 
@@ -156,9 +180,9 @@ def get_model():
     global model
     if model is None:
         model = AutoModelForSequenceClassification.from_pretrained(
-            MODEL_NAME_OR_DIR, local_files_only=is_docker()
+            MODEL_DIR_OR_NAME, local_files_only=LOCAL_FILES_ONLY
         )
-        model.to(get_device())
+        model.to(DEVICE)
         model.eval()
 
         cfg_map = model.config.id2label
@@ -175,92 +199,19 @@ def get_model():
     return model
 
 
-def get_device():
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    return torch.device("cpu")
+def clean_text(title: str, body: str) -> str:
+    title_parts = ALLOWED_REGEX_PATTERN.findall(
+        unicodedata.normalize("NFKC", title) if isinstance(title, str) else ""
+    )
+    body_parts = ALLOWED_REGEX_PATTERN.findall(
+        unicodedata.normalize("NFKC", body) if isinstance(body, str) else ""
+    )
 
-
-def clean_text(text: str) -> str:
-    if not isinstance(text, str):
+    combined_parts = title_parts + body_parts
+    if not combined_parts:
         return ""
 
-    # Normalize unicode
-    text = unicodedata.normalize("NFKC", text)
-
-    clean_chars = []
-    for ch in text:
-        cat = unicodedata.category(ch)
-
-        # Keep: letters, digits, punctuation, currency symbols, whitespace
-        if (
-            cat.startswith("L")  # Letters
-            or cat.startswith("N")  # Numbers
-            or cat.startswith("P")  # Punctuation
-            or cat == "Sc"  # Currency symbol
-            or ch.isspace()
-        ):
-            clean_chars.append(ch)
-
-    cleaned_text = "".join(clean_chars)
-    # Collapse repeated whitespace
-    return " ".join(cleaned_text.split())
-
-
-@torch.no_grad()
-def analyze_sentiment(texts):
-    tokenizer = get_tokenizer()
-    encodings = tokenizer(
-        texts,
-        padding=True,
-        truncation=True,
-        max_length=TOKENIZER_MAX_LENGTH,
-        return_tensors="pt",
-    )
-    token_counts = (
-        (encodings["attention_mask"] == 1).sum(dim=1).cpu().numpy().astype(np.int32)
-    )
-    device = get_device()
-    encodings = {k: v.to(device) for k, v in encodings.items()}
-    model = get_model()
-    outputs = model(**encodings)
-    probs = torch.nn.functional.softmax(outputs.logits, dim=-1).cpu()
-    scores = (probs[:, model.pos_idx] - probs[:, model.neg_idx]).tolist()
-    return scores, token_counts
-
-
-def detect_available_memory_mb() -> int:
-    mem_env = os.getenv("AWS_LAMBDA_FUNCTION_MEMORY_SIZE")
-    if mem_env:
-        return int(mem_env)
-
-    try:
-        with open("/proc/meminfo") as f:
-            for line in f:
-                if line.startswith("MemAvailable:"):
-                    parts = line.split()
-                    kb = int(parts[1])
-                    return kb // 1024
-    except Exception:
-        pass
-
-    return 1024
-
-
-def choose_batch_size():
-    mem = detect_available_memory_mb()
-    if mem >= 3000:
-        return 48
-    elif mem >= 2000:
-        return 32
-    elif mem >= 1500:
-        return 24
-    elif mem >= 1000:
-        return 16
-    elif mem >= 500:
-        return 8
-    else:
-        return 4
+    return " ".join("".join(combined_parts).split())
 
 
 def fast_skew(x):
@@ -289,8 +240,8 @@ def fast_kurtosis(x):
     return np.mean(((arr - m) / s) ** 4) - 3
 
 
-def get_sentiment(pa_date: pa.Date32Scalar) -> pa.Table:
-    date_str = pa_date.as_py().isoformat()
+def get_sentiment(py_date: date) -> pa.Table:
+    date_str = py_date.isoformat()
     raw_key = f"{RAW_PREFIX}{date_str}/data.parquet"
     sentiment_key = f"{SENTIMENT_PREFIX}{date_str}/data.parquet"
 
@@ -304,72 +255,87 @@ def get_sentiment(pa_date: pa.Date32Scalar) -> pa.Table:
         raw_table = s.read_parquet_s3(BUCKET, raw_key, RAW_SCHEMA)
     except ClientError as e:
         if e.response.get("Error", {}).get("Code", "") == "NoSuchKey":
-            # IMPORTANT: If raw parquet is missing or empty, DO NOT create sentiment/aggregated files.
-            # This preserves the signal that raw data itself is missing and prevents silent imputation.
             return None
         raise
 
     row_count = raw_table.num_rows
     if row_count == 0:
-        return None
+        raise ValueError(f"empty raw file for {date_str}")
 
-    titles = raw_table["title"]
-    bodies = raw_table["body"]
+    titles = raw_table["title"].to_pylist()
+    bodies = raw_table["body"].to_pylist()
 
-    cleaned_texts = []
-    for i in range(row_count):
-        title = titles[i].as_py() or ""
-        body = bodies[i].as_py() or ""
-        text = f"{title} {body}"
-        cleaned_text = clean_text(text)
-        cleaned_texts.append(cleaned_text)
+    cleaned_texts = [clean_text(title, body) for title, body in zip(titles, bodies)]
+    text_lengths = np.fromiter(
+        (len(text) for text in cleaned_texts),
+        dtype=np.int32,
+        count=row_count,
+    )
 
-    batch_size = choose_batch_size()
-    sentiment_scores = []
-    token_counts = []
+    tokenizer = get_tokenizer()
+    model = get_model()
 
-    for i in range(0, row_count, batch_size):
-        batch_texts = cleaned_texts[i : i + batch_size]
-        batch_scores, batch_token_counts = analyze_sentiment(batch_texts)
+    batch_size = BATCH_SIZE
 
-        if len(batch_scores) != len(batch_texts):
-            raise ValueError(
-                f"Batch sentiment mismatch for {pa_date}: expected {len(batch_texts)}, got {len(batch_scores)}"
+    sentiment_scores = np.empty(row_count, dtype=np.float32)
+    token_counts = np.empty(row_count, dtype=np.int32)
+
+    with torch.inference_mode():
+        for from_index in range(0, row_count, batch_size):
+            to_index = min(from_index + batch_size, row_count)
+
+            batch_texts = cleaned_texts[from_index:to_index]
+
+            model_inputs = tokenizer(
+                batch_texts,
+                padding=True,
+                truncation=True,
+                max_length=TOKENIZER_MAX_LENGTH,
+                return_tensors="pt",
             )
 
-        if len(batch_token_counts) != len(batch_texts):
-            raise ValueError(
-                f"Batch sentiment mismatch for {pa_date}: expected {len(batch_texts)}, got {len(batch_token_counts)}"
-            )
+            if CPU_ONLY:
+                outputs = model(**model_inputs)
+                probabilites = torch.softmax(outputs.logits, dim=-1)
+                batch_sentiment_scores = (
+                    probabilites[:, model.pos_idx] - probabilites[:, model.neg_idx]
+                ).numpy()
+                batch_token_counts = (
+                    (model_inputs["attention_mask"] == 1)
+                    .sum(dim=1)
+                    .numpy()
+                    .astype(np.int32)
+                )
 
-        sentiment_scores.extend(batch_scores)
-        token_counts.extend(batch_token_counts)
+            else:
+                for k in model_inputs:
+                    model_inputs[k] = model_inputs[k].to(DEVICE, non_blocking=True)
 
-    if len(sentiment_scores) != row_count:
-        raise ValueError(
-            f"Total sentiment mismatch for {pa_date}: expected {row_count}, got {len(sentiment_scores)}"
-        )
+                outputs = model(**model_inputs)
+                probabilites = torch.softmax(outputs.logits, dim=-1)
+                batch_sentiment_scores = (
+                    (probabilites[:, model.pos_idx] - probabilites[:, model.neg_idx])
+                    .cpu()
+                    .numpy()
+                )
+                batch_token_counts = (
+                    (model_inputs["attention_mask"] == 1)
+                    .sum(dim=1)
+                    .cpu()
+                    .numpy()
+                    .astype(np.int32)
+                )
 
-    local_date_arr = pa.repeat(pa_date, row_count)
-    id_arr = raw_table["id"]
-    sentiment_scores_arr = pa.array(
-        np.asarray(sentiment_scores, dtype=np.float32), pa.float32()
-    )
-    text_length_arr = pa.array(
-        np.fromiter(
-            (len(s) for s in cleaned_texts), dtype=np.int32, count=len(cleaned_texts)
-        ),
-        pa.int32(),
-    )
-    token_count_arr = pa.array(np.asarray(token_counts, dtype=np.int32), pa.int32())
+            sentiment_scores[from_index:to_index] = batch_sentiment_scores
+            token_counts[from_index:to_index] = batch_token_counts
 
     table = pa.Table.from_arrays(
         [
-            local_date_arr,
-            id_arr,
-            sentiment_scores_arr,
-            text_length_arr,
-            token_count_arr,
+            pa.repeat(pa.scalar(py_date, type=pa.date32()), row_count),
+            raw_table["id"],
+            pa.array(sentiment_scores, pa.float32()),
+            pa.array(text_lengths, pa.int32()),
+            pa.array(token_counts, pa.int32()),
         ],
         names=SENTIMENT_SCHEMA.names,
     )
@@ -378,70 +344,78 @@ def get_sentiment(pa_date: pa.Date32Scalar) -> pa.Table:
     return table
 
 
-def get_aggregated(py_date: date) -> pa.Table:
+def get_aggregated(py_date: date) -> dict[str, float]:
     aggregated_key = f"{AGGREGATED_PREFIX}{py_date.isoformat()}/data.parquet"
 
     try:
-        agg_table = s.read_parquet_s3(BUCKET, aggregated_key, AGGREGATED_SCHEMA)
+        aggregated_table = s.read_parquet_s3(BUCKET, aggregated_key, AGGREGATED_SCHEMA)
+        return {
+            column_name: aggregated_table[column_name][0].as_py()
+            for column_name in AGGREGATED_COLUMNS
+        }
+
     except ClientError as e:
         if e.response.get("Error", {}).get("Code", "") != "NoSuchKey":
             raise
 
-        pa_date: pa.Date32Scalar = pa.scalar(py_date, type=pa.date32())
-        sentiment_table = get_sentiment(pa_date)
-        if sentiment_table is None or sentiment_table.num_rows == 0:
-            agg_table = pa.Table.from_arrays(
-                [pa.repeat(pa_date, 1)]
-                + [EMPTY_AGG_VALUES[name] for name in AGGREGATED_COLUMNS],
-                schema=AGGREGATED_SCHEMA,
+        sentiment_table = get_sentiment(py_date)
+        if sentiment_table is None:
+            return EMPTY_AGGREGATED_DICT.copy()
+        elif sentiment_table.num_rows == 0:
+            raise ValueError(f"unexpected empty sentiment file for {py_date}")
+        else:
+            sentiment_scores = (
+                sentiment_table["sentiment_score"]
+                .to_numpy()
+                .astype(np.float32, copy=False)
+            )
+            text_lengths = (
+                sentiment_table["text_length"].to_numpy().astype(np.float32, copy=False)
             )
 
-        else:
-            scores = sentiment_table["sentiment_score"].to_numpy()
-            scores_abs = np.abs(scores)
-            is_positive = scores > 0
-            is_negative = scores < 0
-            is_neutral = scores_abs < NEUTRAL_THRESHOLD
-            is_extreme = scores_abs > EXTREME_THRESHOLD
-            text_lengths = sentiment_table["text_length"].to_numpy()
+            absolute_scores = np.abs(sentiment_scores, dtype=np.float32)
+            is_positive = sentiment_scores > 0
+            is_negative = sentiment_scores < 0
+            is_neutral = absolute_scores < NEUTRAL_THRESHOLD
+            is_extreme = absolute_scores > EXTREME_THRESHOLD
 
-            count_articles = int(scores.size)
+            count_articles = sentiment_scores.size
 
-            mean_sentiment = np.float32(scores.mean())
-            median_sentiment = np.float32(np.median(scores))
+            mean_sentiment = np.float32(sentiment_scores.mean())
+            median_sentiment = np.float32(np.median(sentiment_scores))
 
             pct_positive = np.float32(is_positive.mean())
             pct_negative = np.float32(is_negative.mean())
             polarity_ratio = np.float32(pct_positive - pct_negative)
 
             weighted_mean_sentiment = np.float32(
-                (scores * text_lengths).sum()
-                / (text_lengths.sum() + PREVENT_DIV_BY_ZERO)
+                (sentiment_scores * text_lengths).sum(dtype=np.float32)
+                / (text_lengths.sum(dtype=np.float32) + PREVENT_DIV_BY_ZERO)
             )
 
             extreme_sentiment_share = np.float32(is_extreme.mean())
             neutral_share = np.float32(is_neutral.mean())
 
-            sentiment_skewness = np.float32(fast_skew(scores))
-            sentiment_kurtosis = np.float32(fast_kurtosis(scores))
+            sentiment_skewness = np.float32(fast_skew(sentiment_scores))
+            sentiment_kurtosis = np.float32(fast_kurtosis(sentiment_scores))
 
-            max_sentiment = np.float32(scores.max())
-            min_sentiment = np.float32(scores.min())
+            max_sentiment = np.float32(sentiment_scores.max())
+            min_sentiment = np.float32(sentiment_scores.min())
 
-            article_length_variance = np.float32(text_lengths.var())
+            article_length_variance = np.float32(text_lengths.var(dtype=np.float32))
 
             ratio_pos_neg = np.float32(
-                pct_positive / (is_negative.mean() + PREVENT_DIV_BY_ZERO)
+                pct_positive / (pct_negative + PREVENT_DIV_BY_ZERO)
             )
 
-            conflict_mask = (scores_abs >= CONFLICT_THRESHOLD_LOW) & (
-                scores_abs <= CONFLICT_THRESHOLD_HIGH
+            conflict_mask = (absolute_scores >= CONFLICT_THRESHOLD_LOW) & (
+                absolute_scores <= CONFLICT_THRESHOLD_HIGH
             )
             conflict_share = np.float32(conflict_mask.mean())
 
-            agg_table = pa.Table.from_arrays(
+            aggregated_table = pa.Table.from_arrays(
                 [
-                    pa.repeat(pa_date, 1),
+                    pa.repeat(pa.scalar(py_date, type=pa.date32()), 1),
                     pa.array([count_articles], pa.int32()),
                     pa.array([mean_sentiment], pa.float32()),
                     pa.array([median_sentiment], pa.float32()),
@@ -462,38 +436,41 @@ def get_aggregated(py_date: date) -> pa.Table:
                 schema=AGGREGATED_SCHEMA,
             )
 
-            s.write_parquet_s3(agg_table, BUCKET, aggregated_key, AGGREGATED_SCHEMA)
+            s.write_parquet_s3(
+                aggregated_table, BUCKET, aggregated_key, AGGREGATED_SCHEMA
+            )
 
-    if agg_table is None:
-        raise ValueError("Unexpected None result in get_aggregated()")
+            aggregated_values = [
+                count_articles,
+                mean_sentiment,
+                median_sentiment,
+                pct_positive,
+                pct_negative,
+                polarity_ratio,
+                weighted_mean_sentiment,
+                extreme_sentiment_share,
+                sentiment_skewness,
+                sentiment_kurtosis,
+                neutral_share,
+                max_sentiment,
+                min_sentiment,
+                article_length_variance,
+                ratio_pos_neg,
+                conflict_share,
+            ]
 
-    if agg_table.num_rows != 1:
-        raise ValueError(
-            f"Aggregated result for {py_date} has {agg_table.num_rows} rows, expected 1"
-        )
-
-    return agg_table
-
-
-def continue_execution(context=None):
-    if (
-        context is not None
-        and int(context.get_remaining_time_in_millis()) < MIN_REMAINING_MS
-    ):
-        logger.warning(f"Stopping execution due to timeout limit.")
-        return False
-
-    return True
+            return dict(zip(AGGREGATED_COLUMNS, aggregated_values))
 
 
 def append_lagged_row(lagged_columns: dict, py_date: date, window: deque):
     lagged_columns["localDate"].append(py_date)
     lag = LAG_DAYS
 
-    for agg_table in window:
-        for col in AGGREGATED_COLUMNS:
-            value = agg_table[col][0].as_py()
-            lagged_columns[f"{col}-{lag}"].append(value)
+    for aggregated_values in window:
+        for column_name in AGGREGATED_COLUMNS:
+            lagged_columns[f"{column_name}-{lag}"].append(
+                aggregated_values[column_name]
+            )
         lag -= 1
 
 
@@ -510,31 +487,32 @@ def generate_lagged_features(context=None):
         if last_processed > last_added:
             return {"statusCode": 200, "body": "all data already processed"}
 
-        current = last_processed + ONE_DAY
+        current_date = last_processed + ONE_DAY
 
         rolling_window = deque(maxlen=LAG_DAYS)
         for i in range(LAG_DAYS, 1, -1):
-            lag_date = current - timedelta(days=i)
-            agg_table = get_aggregated(lag_date)
-            rolling_window.append(agg_table)
+            lag_date = current_date - timedelta(days=i)
+            aggregated_dict = get_aggregated(lag_date)
+            rolling_window.append(aggregated_dict)
 
         lagged_columns = {field.name: [] for field in LAGGED_SCHEMA}
 
         days_processed = 0
 
-        while continue_execution(context):
+        while s.continue_execution(context):
             if days_processed == DEBUG_MAX_DAYS_PER_INVOCATION:
                 break
 
-            prev = current - ONE_DAY
-            if prev > last_added:
+            prev_date = current_date - ONE_DAY
+            if prev_date > last_added:
                 break
 
-            rolling_window.append(get_aggregated(prev))
-            append_lagged_row(lagged_columns, current, rolling_window)
+            aggregated_dict = get_aggregated(prev_date)
+            rolling_window.append(aggregated_dict)
+            append_lagged_row(lagged_columns, current_date, rolling_window)
             days_processed += 1
-            logger.info(f"Computed lagged features for {current}")
-            current += ONE_DAY
+            LOGGER.info(f"Computed lagged features for {current_date}")
+            current_date += ONE_DAY
 
         if days_processed == 0:
             return {
@@ -563,7 +541,7 @@ def generate_lagged_features(context=None):
             "body": f"finished preprocessing up to and including {new_last_processed:%Y-%m-%d}",
         }
     except Exception:
-        logger.exception("Error in generate_lagged_features")
+        LOGGER.exception("Error in generate_lagged_features")
         return {"statusCode": 500, "body": "error"}
 
 

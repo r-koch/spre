@@ -21,7 +21,6 @@ AWS_REGION = os.getenv("AWS_REGION", "eu-west-1")
 RETRY_COUNT = int(os.getenv("RETRY_COUNT", "3"))
 RETRY_DELAY_S = float(os.getenv("RETRY_DELAY_S", "0.25"))
 RETRY_MAX_DELAY_S = float(os.getenv("RETRY_MAX_DELAY_S", "2.0"))
-TEMP_PREFIX = os.getenv("TEMP_PREFIX", "tmp/")
 
 
 s3 = boto3.client("s3", region_name=AWS_REGION)
@@ -129,17 +128,10 @@ def write_parquet_s3(table: pa.Table, bucket: str, key: str, schema: pa.Schema):
         )
 
     buffer = BytesIO()
-    pq.write_table(table, buffer, compression="zstd", compression_level=3)
+    pq.write_table(table, buffer, compression="zstd", compression_level=1)
     data = buffer.getvalue()
 
-    temp_key = f"{TEMP_PREFIX}{key}"
-    retry_s3(lambda: s3.put_object(Bucket=bucket, Key=temp_key, Body=data))
-    retry_s3(
-        lambda: s3.copy_object(
-            Bucket=bucket, CopySource={"Bucket": bucket, "Key": temp_key}, Key=key
-        )
-    )
-    retry_s3(lambda: s3.delete_object(Bucket=bucket, Key=temp_key))
+    retry_s3(lambda: s3.put_object(Bucket=bucket, Key=key, Body=data))
 
 
 def schema_mismatch(expected: pa.Schema, actual: pa.Schema) -> bool:
