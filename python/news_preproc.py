@@ -15,7 +15,7 @@ _pyarrow = None
 _torch = None
 
 
-def np():
+def numpy():
     global _numpy
     if _numpy is None:
         import numpy as np
@@ -24,7 +24,7 @@ def np():
     return _numpy
 
 
-def pa():
+def pyarrow():
     global _pyarrow
     if _pyarrow is None:
         import pyarrow as pa
@@ -125,13 +125,13 @@ _raw_schema = None
 def get_raw_schema():
     global _raw_schema
     if _raw_schema is None:
-        pa_local = pa()
-        _raw_schema = pa_local.schema(
+        pa = pyarrow()
+        _raw_schema = pa.schema(
             {
-                "localDate": pa_local.date32(),
-                "id": pa_local.string(),
-                "title": pa_local.string(),
-                "body": pa_local.string(),
+                "localDate": pa.date32(),
+                "id": pa.string(),
+                "title": pa.string(),
+                "body": pa.string(),
             }
         )
 
@@ -144,14 +144,14 @@ _sentiment_schema = None
 def get_sentiment_schema():
     global _sentiment_schema
     if _sentiment_schema is None:
-        pa_local = pa()
-        _sentiment_schema = pa_local.schema(
+        pa = pyarrow()
+        _sentiment_schema = pa.schema(
             {
-                "localDate": pa_local.date32(),
-                "id": pa_local.string(),
-                "sentiment_score": pa_local.float32(),
-                "text_length": pa_local.int32(),
-                "token_count": pa_local.int32(),
+                "localDate": pa.date32(),
+                "id": pa.string(),
+                "sentiment_score": pa.float32(),
+                "text_length": pa.int32(),
+                "token_count": pa.int32(),
             }
         )
 
@@ -164,26 +164,26 @@ _aggregated_schema = None
 def get_aggregated_schema():
     global _aggregated_schema
     if _aggregated_schema is None:
-        pa_local = pa()
-        _aggregated_schema = pa_local.schema(
+        pa = pyarrow()
+        _aggregated_schema = pa.schema(
             {
-                "localDate": pa_local.date32(),
-                "count_articles": pa_local.int32(),
-                "mean_sentiment": pa_local.float32(),
-                "median_sentiment": pa_local.float32(),
-                "pct_positive": pa_local.float32(),
-                "pct_negative": pa_local.float32(),
-                "polarity_ratio": pa_local.float32(),
-                "weighted_mean_sentiment": pa_local.float32(),
-                "extreme_sentiment_share": pa_local.float32(),
-                "sentiment_skewness": pa_local.float32(),
-                "sentiment_kurtosis": pa_local.float32(),
-                "neutral_share": pa_local.float32(),
-                "max_sentiment": pa_local.float32(),
-                "min_sentiment": pa_local.float32(),
-                "article_length_variance": pa_local.float32(),
-                "ratio_pos_neg": pa_local.float32(),
-                "conflict_share": pa_local.float32(),
+                "localDate": pa.date32(),
+                "count_articles": pa.int32(),
+                "mean_sentiment": pa.float32(),
+                "median_sentiment": pa.float32(),
+                "pct_positive": pa.float32(),
+                "pct_negative": pa.float32(),
+                "polarity_ratio": pa.float32(),
+                "weighted_mean_sentiment": pa.float32(),
+                "extreme_sentiment_share": pa.float32(),
+                "sentiment_skewness": pa.float32(),
+                "sentiment_kurtosis": pa.float32(),
+                "neutral_share": pa.float32(),
+                "max_sentiment": pa.float32(),
+                "min_sentiment": pa.float32(),
+                "article_length_variance": pa.float32(),
+                "ratio_pos_neg": pa.float32(),
+                "conflict_share": pa.float32(),
             }
         )
     return _aggregated_schema
@@ -207,14 +207,14 @@ _lagged_schema = None
 def get_lagged_schema():
     global _lagged_schema
     if _lagged_schema is None:
-        pa_local = pa()
-        fields = [pa_local.field("localDate", pa_local.date32())]
+        pa = pyarrow()
+        fields = [pa.field("localDate", pa.date32())]
         aggregated_columns = get_aggregated_columns()
         for lag in range(1, LAG_DAYS + 1):
             for col in aggregated_columns:
-                fields.append(pa_local.field(f"{col}-{lag}", pa_local.float32()))
+                fields.append(pa.field(f"{col}-{lag}", pa.float32()))
 
-        _lagged_schema = pa_local.schema(fields)
+        _lagged_schema = pa.schema(fields)
     return _lagged_schema
 
 
@@ -254,12 +254,8 @@ _device = None
 def get_device():
     global _device
     if _device is None:
-        torch_local = torch()
-        _device = (
-            torch_local.device("cuda")
-            if torch_local.cuda.is_available()
-            else torch_local.device("cpu")
-        )
+        trc = torch()
+        _device = trc.device("cuda") if trc.cuda.is_available() else trc.device("cpu")
     return _device
 
 
@@ -276,9 +272,9 @@ def is_cpu_only():
 def init_torch():
     vcpus = os.cpu_count() or 1
     LOGGER.info(f"vcpu count: {vcpus}")
-    torch_local = torch()
-    torch_local.set_num_threads(min(vcpus, 4))
-    torch_local.set_num_interop_threads(min(vcpus, 2))
+    trc = torch()
+    trc.set_num_threads(min(vcpus, 4))
+    trc.set_num_interop_threads(min(vcpus, 2))
 
 
 _tokenizer = None
@@ -339,9 +335,9 @@ def clean_text(title: str, body: str) -> str:
 
 
 def fast_skew(x):
-    np_local = np()
-    arr = np_local.asarray(x, dtype=np_local.float64)
-    arr = arr[~np_local.isnan(arr)]
+    np = numpy()
+    arr = np.asarray(x, dtype=np.float64)
+    arr = arr[~np.isnan(arr)]
     n = len(arr)
     if n < 3:
         return 0.0
@@ -349,13 +345,13 @@ def fast_skew(x):
     s = arr.std(ddof=0)
     if s == 0:
         return 0.0
-    return np_local.mean(((arr - m) / s) ** 3)
+    return np.mean(((arr - m) / s) ** 3)
 
 
 def fast_kurtosis(x):
-    np_local = np()
-    arr = np_local.asarray(x, dtype=np_local.float64)
-    arr = arr[~np_local.isnan(arr)]
+    np = numpy()
+    arr = np.asarray(x, dtype=np.float64)
+    arr = arr[~np.isnan(arr)]
     n = len(arr)
     if n < 4:
         return 0.0
@@ -363,7 +359,7 @@ def fast_kurtosis(x):
     s = arr.std(ddof=0)
     if s == 0:
         return 0.0
-    return np_local.mean(((arr - m) / s) ** 4) - 3
+    return np.mean(((arr - m) / s) ** 4) - 3
 
 
 def get_sentiment(py_date: date):
@@ -396,12 +392,12 @@ def get_sentiment(py_date: date):
     titles = raw_table["title"].to_pylist()
     bodies = raw_table["body"].to_pylist()
 
-    np_local = np()
+    np = numpy()
 
     cleaned_texts = [clean_text(title, body) for title, body in zip(titles, bodies)]
-    text_lengths = np_local.fromiter(
+    text_lengths = np.fromiter(
         (len(text) for text in cleaned_texts),
-        dtype=np_local.int32,
+        dtype=np.int32,
         count=row_count,
     )
 
@@ -410,12 +406,12 @@ def get_sentiment(py_date: date):
 
     batch_size = BATCH_SIZE
 
-    sentiment_scores = np_local.empty(row_count, dtype=np_local.float32)
-    token_counts = np_local.empty(row_count, dtype=np_local.int32)
+    sentiment_scores = np.empty(row_count, dtype=np.float32)
+    token_counts = np.empty(row_count, dtype=np.int32)
 
-    torch_local = torch()
+    trc = torch()
 
-    with torch_local.inference_mode():
+    with trc.inference_mode():
         for from_index in range(0, row_count, batch_size):
             to_index = min(from_index + batch_size, row_count)
 
@@ -431,7 +427,7 @@ def get_sentiment(py_date: date):
 
             if is_cpu_only():
                 outputs = model(**model_inputs)
-                probabilites = torch_local.softmax(outputs.logits, dim=-1)
+                probabilites = trc.softmax(outputs.logits, dim=-1)
                 batch_sentiment_scores = (
                     probabilites[:, model.pos_idx] - probabilites[:, model.neg_idx]
                 ).numpy()
@@ -439,7 +435,7 @@ def get_sentiment(py_date: date):
                     (model_inputs["attention_mask"] == 1)
                     .sum(dim=1)
                     .numpy()
-                    .astype(np_local.int32)
+                    .astype(np.int32)
                 )
 
             else:
@@ -449,7 +445,7 @@ def get_sentiment(py_date: date):
                     )
 
                 outputs = model(**model_inputs)
-                probabilites = torch_local.softmax(outputs.logits, dim=-1)
+                probabilites = trc.softmax(outputs.logits, dim=-1)
                 batch_sentiment_scores = (
                     (probabilites[:, model.pos_idx] - probabilites[:, model.neg_idx])
                     .cpu()
@@ -460,22 +456,20 @@ def get_sentiment(py_date: date):
                     .sum(dim=1)
                     .cpu()
                     .numpy()
-                    .astype(np_local.int32)
+                    .astype(np.int32)
                 )
 
             sentiment_scores[from_index:to_index] = batch_sentiment_scores
             token_counts[from_index:to_index] = batch_token_counts
 
-    pa_local = pa()
-    table = pa_local.Table.from_arrays(
+    pa = pyarrow()
+    table = pa.Table.from_arrays(
         [
-            pa_local.repeat(
-                pa_local.scalar(py_date, type=pa_local.date32()), row_count
-            ),
+            pa.repeat(pa.scalar(py_date, type=pa.date32()), row_count),
             raw_table["id"],
-            pa_local.array(sentiment_scores, pa_local.float32()),
-            pa_local.array(text_lengths, pa_local.int32()),
-            pa_local.array(token_counts, pa_local.int32()),
+            pa.array(sentiment_scores, pa.float32()),
+            pa.array(text_lengths, pa.int32()),
+            pa.array(token_counts, pa.int32()),
         ],
         names=sentiment_schema.names,
     )
@@ -509,83 +503,77 @@ def get_aggregated(py_date: date) -> dict[str, float]:
         elif sentiment_table.num_rows == 0:
             raise ValueError(f"unexpected empty sentiment file for {py_date}")
         else:
-            np_local = np()
+            np = numpy()
 
             sentiment_scores = (
                 sentiment_table["sentiment_score"]
                 .to_numpy()
-                .astype(np_local.float32, copy=False)
+                .astype(np.float32, copy=False)
             )
             text_lengths = (
-                sentiment_table["text_length"]
-                .to_numpy()
-                .astype(np_local.float32, copy=False)
+                sentiment_table["text_length"].to_numpy().astype(np.float32, copy=False)
             )
 
-            absolute_scores = np_local.abs(sentiment_scores, dtype=np_local.float32)
+            absolute_scores = np.abs(sentiment_scores, dtype=np.float32)
             is_positive = sentiment_scores > 0
             is_negative = sentiment_scores < 0
-            is_neutral = absolute_scores < np_local.float32(NEUTRAL_THRESHOLD)
-            is_extreme = absolute_scores > np_local.float32(EXTREME_THRESHOLD)
+            is_neutral = absolute_scores < np.float32(NEUTRAL_THRESHOLD)
+            is_extreme = absolute_scores > np.float32(EXTREME_THRESHOLD)
 
             count_articles = sentiment_scores.size
 
-            mean_sentiment = np_local.float32(sentiment_scores.mean())
-            median_sentiment = np_local.float32(np_local.median(sentiment_scores))
+            mean_sentiment = np.float32(sentiment_scores.mean())
+            median_sentiment = np.float32(np.median(sentiment_scores))
 
-            pct_positive = np_local.float32(is_positive.mean())
-            pct_negative = np_local.float32(is_negative.mean())
-            polarity_ratio = np_local.float32(pct_positive - pct_negative)
+            pct_positive = np.float32(is_positive.mean())
+            pct_negative = np.float32(is_negative.mean())
+            polarity_ratio = np.float32(pct_positive - pct_negative)
 
-            weighted_mean_sentiment = np_local.float32(
-                (sentiment_scores * text_lengths).sum(dtype=np_local.float32)
-                / (text_lengths.sum(dtype=np_local.float32) + PREVENT_DIV_BY_ZERO)
+            weighted_mean_sentiment = np.float32(
+                (sentiment_scores * text_lengths).sum(dtype=np.float32)
+                / (text_lengths.sum(dtype=np.float32) + PREVENT_DIV_BY_ZERO)
             )
 
-            extreme_sentiment_share = np_local.float32(is_extreme.mean())
-            neutral_share = np_local.float32(is_neutral.mean())
+            extreme_sentiment_share = np.float32(is_extreme.mean())
+            neutral_share = np.float32(is_neutral.mean())
 
-            sentiment_skewness = np_local.float32(fast_skew(sentiment_scores))
-            sentiment_kurtosis = np_local.float32(fast_kurtosis(sentiment_scores))
+            sentiment_skewness = np.float32(fast_skew(sentiment_scores))
+            sentiment_kurtosis = np.float32(fast_kurtosis(sentiment_scores))
 
-            max_sentiment = np_local.float32(sentiment_scores.max())
-            min_sentiment = np_local.float32(sentiment_scores.min())
+            max_sentiment = np.float32(sentiment_scores.max())
+            min_sentiment = np.float32(sentiment_scores.min())
 
-            article_length_variance = np_local.float32(
-                text_lengths.var(dtype=np_local.float32)
-            )
+            article_length_variance = np.float32(text_lengths.var(dtype=np.float32))
 
-            ratio_pos_neg = np_local.float32(
+            ratio_pos_neg = np.float32(
                 pct_positive / (pct_negative + PREVENT_DIV_BY_ZERO)
             )
 
-            conflict_mask = (
-                absolute_scores >= np_local.float32(CONFLICT_THRESHOLD_LOW)
-            ) & (absolute_scores <= np_local.float32(CONFLICT_THRESHOLD_HIGH))
-            conflict_share = np_local.float32(conflict_mask.mean())
+            conflict_mask = (absolute_scores >= np.float32(CONFLICT_THRESHOLD_LOW)) & (
+                absolute_scores <= np.float32(CONFLICT_THRESHOLD_HIGH)
+            )
+            conflict_share = np.float32(conflict_mask.mean())
 
-            pa_local = pa()
-            aggregated_table = pa_local.Table.from_arrays(
+            pa = pyarrow()
+            aggregated_table = pa.Table.from_arrays(
                 [
-                    pa_local.repeat(
-                        pa_local.scalar(py_date, type=pa_local.date32()), 1
-                    ),
-                    pa_local.array([count_articles], pa_local.int32()),
-                    pa_local.array([mean_sentiment], pa_local.float32()),
-                    pa_local.array([median_sentiment], pa_local.float32()),
-                    pa_local.array([pct_positive], pa_local.float32()),
-                    pa_local.array([pct_negative], pa_local.float32()),
-                    pa_local.array([polarity_ratio], pa_local.float32()),
-                    pa_local.array([weighted_mean_sentiment], pa_local.float32()),
-                    pa_local.array([extreme_sentiment_share], pa_local.float32()),
-                    pa_local.array([sentiment_skewness], pa_local.float32()),
-                    pa_local.array([sentiment_kurtosis], pa_local.float32()),
-                    pa_local.array([neutral_share], pa_local.float32()),
-                    pa_local.array([max_sentiment], pa_local.float32()),
-                    pa_local.array([min_sentiment], pa_local.float32()),
-                    pa_local.array([article_length_variance], pa_local.float32()),
-                    pa_local.array([ratio_pos_neg], pa_local.float32()),
-                    pa_local.array([conflict_share], pa_local.float32()),
+                    pa.repeat(pa.scalar(py_date, type=pa.date32()), 1),
+                    pa.array([count_articles], pa.int32()),
+                    pa.array([mean_sentiment], pa.float32()),
+                    pa.array([median_sentiment], pa.float32()),
+                    pa.array([pct_positive], pa.float32()),
+                    pa.array([pct_negative], pa.float32()),
+                    pa.array([polarity_ratio], pa.float32()),
+                    pa.array([weighted_mean_sentiment], pa.float32()),
+                    pa.array([extreme_sentiment_share], pa.float32()),
+                    pa.array([sentiment_skewness], pa.float32()),
+                    pa.array([sentiment_kurtosis], pa.float32()),
+                    pa.array([neutral_share], pa.float32()),
+                    pa.array([max_sentiment], pa.float32()),
+                    pa.array([min_sentiment], pa.float32()),
+                    pa.array([article_length_variance], pa.float32()),
+                    pa.array([ratio_pos_neg], pa.float32()),
+                    pa.array([conflict_share], pa.float32()),
                 ],
                 schema=aggregated_schema,
             )
@@ -688,12 +676,12 @@ def generate_lagged_features(context=None):
                 "body": "no lagged features computed due to lambda timeout",
             }
 
-        pa_local = pa()
+        pa = pyarrow()
         arrays = [
-            pa_local.array(lagged_columns[field.name], type=field.type)
+            pa.array(lagged_columns[field.name], type=field.type)
             for field in lagged_schema
         ]
-        lagged_table = pa_local.Table.from_arrays(arrays, schema=lagged_schema)
+        lagged_table = pa.Table.from_arrays(arrays, schema=lagged_schema)
 
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
         file_name = f"{timestamp}.parquet"

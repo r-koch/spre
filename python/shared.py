@@ -15,7 +15,8 @@ from botocore.exceptions import ClientError
 # ---------- THIRD-PARTY LIBRARIES LAZY ----------
 _pq = None
 
-def pq():
+
+def pyarrow_parquet():
     global _pq
     if _pq is None:
         import pyarrow.parquet as pq
@@ -110,7 +111,7 @@ def read_parquet_s3(bucket: str, key: str, schema):
         s3_object = s3.get_object(Bucket=bucket, Key=key)
         buffer = BytesIO(s3_object["Body"].read())
         try:
-            table = pq().read_table(buffer, columns=schema.names)
+            table = pyarrow_parquet().read_table(buffer, columns=schema.names)
         except Exception as e:
             raise ValueError(f"Corrupted parquet at {key}: {e}")
 
@@ -137,7 +138,9 @@ def write_parquet_s3(table, bucket: str, key: str, schema):
         )
 
     buffer = BytesIO()
-    pq().write_table(table, buffer, compression="zstd", compression_level=1)
+    pyarrow_parquet().write_table(
+        table, buffer, compression="zstd", compression_level=1
+    )
     data = buffer.getvalue()
 
     retry_s3(lambda: s3.put_object(Bucket=bucket, Key=key, Body=data))

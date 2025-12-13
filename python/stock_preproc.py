@@ -10,7 +10,7 @@ from botocore.exceptions import ClientError
 _pyarrow = None
 
 
-def pa():
+def pyarrow():
     global _pyarrow
     if _pyarrow is None:
         import pyarrow as pa
@@ -43,26 +43,26 @@ LOGGER = s.setup_logger()
 
 # ---------- SCHEMAS ----------
 def get_raw_schema():
-    pa_local = pa()
-    return pa_local.schema(
+    pa = pyarrow()
+    return pa.schema(
         {
-            "localDate": pa_local.date32(),
-            "id": pa_local.string(),
-            "close": pa_local.float64(),
-            "high": pa_local.float64(),
-            "low": pa_local.float64(),
-            "open": pa_local.float64(),
-            "volume": pa_local.int64(),
+            "localDate": pa.date32(),
+            "id": pa.string(),
+            "close": pa.float64(),
+            "high": pa.float64(),
+            "low": pa.float64(),
+            "open": pa.float64(),
+            "volume": pa.int64(),
         }
     )
 
 
 def get_symbols_schema():
-    pa_local = pa()
-    return pa_local.schema(
+    pa = pyarrow()
+    return pa.schema(
         {
-            "id": pa_local.string(),
-            "sector": pa_local.string(),
+            "id": pa.string(),
+            "sector": pa.string(),
         }
     )
 
@@ -136,19 +136,19 @@ _pivoted_schema = None
 def get_pivoted_schema():
     global _pivoted_schema
     if _pivoted_schema is None:
-        pa_local = pa()
-        fields = [pa_local.field("localDate", pa_local.date32())]
+        pa = pyarrow()
+        fields = [pa.field("localDate", pa.date32())]
         for sym in get_symbols():
             fields.extend(
                 [
-                    pa_local.field(f"{sym}_close", pa_local.float32()),
-                    pa_local.field(f"{sym}_high", pa_local.float32()),
-                    pa_local.field(f"{sym}_low", pa_local.float32()),
-                    pa_local.field(f"{sym}_open", pa_local.float32()),
-                    pa_local.field(f"{sym}_volume", pa_local.float32()),
+                    pa.field(f"{sym}_close", pa.float32()),
+                    pa.field(f"{sym}_high", pa.float32()),
+                    pa.field(f"{sym}_low", pa.float32()),
+                    pa.field(f"{sym}_open", pa.float32()),
+                    pa.field(f"{sym}_volume", pa.float32()),
                 ]
             )
-        _pivoted_schema = pa_local.schema(fields)
+        _pivoted_schema = pa.schema(fields)
     return _pivoted_schema
 
 
@@ -238,12 +238,12 @@ def generate_pivoted_features(context=None):
                 "body": "no pivoted features computed due to lambda timeout",
             }
 
-        pa_local = pa()
+        pa = pyarrow()
         arrays = [
-            pa_local.array(pivoted_columns[field.name], type=field.type)
+            pa.array(pivoted_columns[field.name], type=field.type)
             for field in pivoted_schema
         ]
-        pivoted_table = pa_local.Table.from_arrays(arrays, schema=pivoted_schema)
+        pivoted_table = pa.Table.from_arrays(arrays, schema=pivoted_schema)
 
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
         file_name = f"{timestamp}.parquet"
