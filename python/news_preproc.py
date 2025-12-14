@@ -270,8 +270,9 @@ def is_cpu_only():
 
 
 def init_torch():
+    # lambda memory of 5308 mb equates to 4 vCPU
     vcpus = os.cpu_count() or 1
-    LOGGER.info(f"vcpu count: {vcpus}")
+    LOGGER.debug(f"vcpu count: {vcpus}")
     trc = torch()
     trc.set_num_threads(min(vcpus, 4))
     trc.set_num_interop_threads(min(vcpus, 2))
