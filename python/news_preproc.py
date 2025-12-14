@@ -621,20 +621,22 @@ def append_lagged_row(
 
 def generate_lagged_features(context=None):
     try:
-        init_torch()
-
-        last_added = s.read_json_date_s3(BUCKET, COLLECTOR_STATE_KEY, LAST_ADDED_KEY)
-        if last_added is None:
+        last_added_date = s.read_json_date_s3(
+            BUCKET, COLLECTOR_STATE_KEY, LAST_ADDED_KEY
+        )
+        if last_added_date is None:
             return {"statusCode": 200, "body": "no raw data to process"}
 
-        default_last_processed = START_DATE - ONE_DAY
-        last_processed = s.read_json_date_s3(
-            BUCKET, PREPROC_STATE_KEY, LAST_PROCESSED_KEY, default_last_processed
+        default_last_processed_date = START_DATE - ONE_DAY
+        last_processed_date = s.read_json_date_s3(
+            BUCKET, PREPROC_STATE_KEY, LAST_PROCESSED_KEY, default_last_processed_date
         )
-        if last_processed > last_added:
+        if last_processed_date > last_added_date:
             return {"statusCode": 200, "body": "all data already processed"}
 
-        current_date = last_processed + ONE_DAY
+        init_torch()
+
+        current_date = last_processed_date + ONE_DAY
 
         rolling_window = deque(maxlen=LAG_DAYS)
         for i in range(LAG_DAYS, 1, -1):
@@ -655,7 +657,7 @@ def generate_lagged_features(context=None):
                 break
 
             prev_date = current_date - ONE_DAY
-            if prev_date > last_added:
+            if prev_date > last_added_date:
                 break
 
             aggregated_dict = get_aggregated(prev_date)
