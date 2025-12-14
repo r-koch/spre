@@ -192,3 +192,15 @@ def write_json_date_s3(bucket: str, s3_key: str, json_key: str, value: date):
         )
 
     retry_s3(op)
+
+
+def list_keys_s3(bucket: str, prefix: str, sort_reversed: bool = False) -> list:
+    def op():
+        keys = []
+        paginator = s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                keys.append(obj["Key"])
+        return sorted(keys, reverse=sort_reversed)
+
+    return cast(list, retry_s3(op))

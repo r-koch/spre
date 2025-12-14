@@ -7,7 +7,17 @@ import shared as s
 from botocore.exceptions import ClientError
 
 # ---------- THIRD-PARTY LIBRARIES LAZY ----------
+_numpy = None
 _pyarrow = None
+
+
+def numpy():
+    global _numpy
+    if _numpy is None:
+        import numpy as np
+
+        _numpy = np
+    return _numpy
 
 
 def pyarrow():
@@ -25,6 +35,7 @@ START_DATE = date.fromisoformat(os.getenv("START_DATE", "1999-11-01"))
 MIN_REMAINING_MS = int(os.getenv("MIN_REMAINING_MS", "10000"))
 DEBUG_MAX_DAYS_PER_INVOCATION = int(os.getenv("DEBUG_MAX_DAYS_PER_INVOCATION", "2"))
 
+MIN_PRICE = 1e-3
 ONE_DAY = timedelta(days=1)
 
 META_DATA = "metadata/"
@@ -37,34 +48,46 @@ LAST_PROCESSED_KEY = "lastProcessed"
 
 RAW_PREFIX = "raw/stock/localDate="
 PIVOTED_PREFIX = "stock/pivoted/"
+TARGET_LOG_RETURNS_PREFIX = "stock/target-log-returns/"
 
 LOGGER = s.setup_logger()
 
-
 # ---------- SCHEMAS ----------
+_raw_schema = None
+
+
 def get_raw_schema():
-    pa = pyarrow()
-    return pa.schema(
-        {
-            "localDate": pa.date32(),
-            "id": pa.string(),
-            "close": pa.float64(),
-            "high": pa.float64(),
-            "low": pa.float64(),
-            "open": pa.float64(),
-            "volume": pa.int64(),
-        }
-    )
+    global _raw_schema
+    if _raw_schema is None:
+        pa = pyarrow()
+        _raw_schema = pa.schema(
+            {
+                "localDate": pa.date32(),
+                "id": pa.string(),
+                "close": pa.float64(),
+                "high": pa.float64(),
+                "low": pa.float64(),
+                "open": pa.float64(),
+                "volume": pa.int64(),
+            }
+        )
+    return _raw_schema
+
+
+_symbols_schema = None
 
 
 def get_symbols_schema():
-    pa = pyarrow()
-    return pa.schema(
-        {
-            "id": pa.string(),
-            "sector": pa.string(),
-        }
-    )
+    global _symbols_schema
+    if _symbols_schema is None:
+        pa = pyarrow()
+        _symbols_schema = pa.schema(
+            {
+                "id": pa.string(),
+                "sector": pa.string(),
+            }
+        )
+    return _symbols_schema
 
 
 _symbols = None
@@ -152,33 +175,37 @@ def get_pivoted_schema():
     return _pivoted_schema
 
 
-def get_raw(py_date: date):
+_target_schema = None
+
+
+def get_target_schema():
+    global _target_schema
+    if _target_schema is None:
+        pa = pyarrow()
+        fields = [pa.field("localDate", pa.date32())]
+        for sym in get_symbols():
+            fields.append(pa.field(f"{sym}_return", pa.float32()))
+        _target_schema = pa.schema(fields)
+    return _target_schema
+
+
+def append_pivoted_row(pivoted_columns: dict, py_date: date):
     raw_key = f"{RAW_PREFIX}{py_date.isoformat()}/data.parquet"
-    return s.read_parquet_s3(BUCKET, raw_key, get_raw_schema())
 
-
-def append_pivoted_row(pivoted_columns: dict, py_date: date) -> bool:
     try:
-        raw_table = get_raw(py_date)
+        raw_table = s.read_parquet_s3(BUCKET, raw_key, get_raw_schema())
     except ClientError as e:
         if e.response.get("Error", {}).get("Code", "") == "NoSuchKey":
-            return False
+            return None
         raise
 
-    if raw_table is None:
-        raise ValueError("raw_table is None")
+    assert raw_table is not None
 
-    col_close = raw_table.column("close").chunks[0]
-    col_high = raw_table.column("high").chunks[0]
-    col_low = raw_table.column("low").chunks[0]
-    col_open = raw_table.column("open").chunks[0]
-    col_volume = raw_table.column("volume").chunks[0]
-
-    closes = col_close.to_numpy()
-    highs = col_high.to_numpy()
-    lows = col_low.to_numpy()
-    opens_ = col_open.to_numpy()
-    volumes = col_volume.to_numpy().astype("float32")
+    closes = raw_table["close"].to_numpy().astype("float32", copy=False)
+    highs = raw_table["high"].to_numpy().astype("float32", copy=False)
+    lows = raw_table["low"].to_numpy().astype("float32", copy=False)
+    opens_ = raw_table["open"].to_numpy().astype("float32", copy=False)
+    volumes = raw_table["volume"].to_numpy().astype("float32", copy=False)
 
     symbols = get_symbols()
     close_cols = get_close_column()
@@ -189,6 +216,7 @@ def append_pivoted_row(pivoted_columns: dict, py_date: date) -> bool:
 
     pc = pivoted_columns
     pc["localDate"].append(py_date)
+
     for i in range(len(symbols)):
         pc[close_cols[i]].append(closes[i])
         pc[high_cols[i]].append(highs[i])
@@ -196,41 +224,121 @@ def append_pivoted_row(pivoted_columns: dict, py_date: date) -> bool:
         pc[open_cols[i]].append(opens_[i])
         pc[volume_cols[i]].append(volumes[i])
 
-    return True
+    return closes
+
+
+def compute_log_returns(prev_closes, curr_closes):
+    np = numpy()
+
+    # compute in float64 for numerical stability, store in float32
+    prev = prev_closes.astype("float64", copy=False)
+    curr = curr_closes.astype("float64", copy=False)
+
+    out = np.zeros_like(prev, dtype="float32")
+
+    valid = (prev > MIN_PRICE) & (curr > MIN_PRICE)
+    if valid.any():
+        out[valid] = np.log(curr[valid] / prev[valid]).astype("float32")
+
+    return out
+
+
+def get_previous_closes(last_processed: date):
+    if last_processed < START_DATE:
+        return None
+
+    keys = s.list_keys_s3(BUCKET, PIVOTED_PREFIX, sort_reversed=True)
+    if not keys:
+        raise ValueError(f"no pivoted data found for {last_processed}")
+
+    schema = get_pivoted_schema()
+    np = numpy()
+    close_cols = get_close_column()
+
+    pivoted_table = s.read_parquet_s3(BUCKET, keys[0], schema)
+    assert pivoted_table is not None
+
+    if pivoted_table["localDate"][-1].as_py() == last_processed:
+        return np.array(
+            [pivoted_table[col][-1].as_py() for col in close_cols],
+            dtype="float32",
+        )
+
+    pa = pyarrow()
+    for key in keys:
+        pivoted_table = s.read_parquet_s3(BUCKET, key, schema)
+        assert pivoted_table is not None
+
+        indices = (pivoted_table["localDate"] == pa.scalar(last_processed)).nonzero()[0]
+        if len(indices) == 1:
+            row_idx = indices[0].as_py()
+            return np.array(
+                [pivoted_table[col][row_idx].as_py() for col in close_cols],
+                dtype="float32",
+            )
+
+    raise ValueError(f"no pivoted data found for {last_processed}")
+
+
+def append_target_row(
+    target_columns: dict, previous_closes, curr_closes, py_date: date
+):
+    target_columns["localDate"].append(py_date)
+
+    if previous_closes is None:
+        for sym in get_symbols():
+            target_columns[f"{sym}_return"].append(0.0)
+    else:
+        returns = compute_log_returns(previous_closes, curr_closes)
+        for sym, value in zip(get_symbols(), returns):
+            target_columns[f"{sym}_return"].append(value)
 
 
 def generate_pivoted_features(context=None):
     try:
-        last_added = s.read_json_date_s3(BUCKET, COLLECTOR_STATE_KEY, LAST_ADDED_KEY)
-        if last_added is None:
+        last_added_date = s.read_json_date_s3(
+            BUCKET, COLLECTOR_STATE_KEY, LAST_ADDED_KEY
+        )
+        if last_added_date is None:
             return {"statusCode": 200, "body": "no raw data to process"}
 
-        default_last_processed = START_DATE - ONE_DAY
-        last_processed = s.read_json_date_s3(
-            BUCKET, PREPROC_STATE_KEY, LAST_PROCESSED_KEY, default_last_processed
+        default_last_processed_date = START_DATE - ONE_DAY
+        last_processed_date = s.read_json_date_s3(
+            BUCKET, PREPROC_STATE_KEY, LAST_PROCESSED_KEY, default_last_processed_date
         )
-        if last_processed >= last_added:
+        if last_processed_date >= last_added_date:
             return {"statusCode": 200, "body": "all data already processed"}
 
-        current = last_processed + ONE_DAY
+        current_date = last_processed_date + ONE_DAY
 
         pivoted_schema = get_pivoted_schema()
         pivoted_columns = {field.name: [] for field in pivoted_schema}
+
+        target_schema = get_target_schema()
+        target_columns = {field.name: [] for field in target_schema}
+
+        previous_closes = get_previous_closes(last_processed_date)
 
         days_processed = 0
 
         while (
             s.continue_execution(context, MIN_REMAINING_MS, LOGGER)
-            and current <= last_added
+            and current_date <= last_added_date
         ):
             if days_processed == DEBUG_MAX_DAYS_PER_INVOCATION:
                 break
 
-            if append_pivoted_row(pivoted_columns, current):
-                days_processed += 1
-                LOGGER.info(f"Computed pivoted features for {current}")
+            curr_closes = append_pivoted_row(pivoted_columns, current_date)
+            if curr_closes is not None:
+                append_target_row(
+                    target_columns, previous_closes, curr_closes, current_date
+                )
 
-            current += ONE_DAY
+                previous_closes = curr_closes
+                days_processed += 1
+
+            LOGGER.info(f"Computed pivoted + target features for {current_date}")
+            current_date += ONE_DAY
 
         if days_processed == 0:
             return {
@@ -239,16 +347,25 @@ def generate_pivoted_features(context=None):
             }
 
         pa = pyarrow()
-        arrays = [
+        pivoted_arrays = [
             pa.array(pivoted_columns[field.name], type=field.type)
             for field in pivoted_schema
         ]
-        pivoted_table = pa.Table.from_arrays(arrays, schema=pivoted_schema)
+        pivoted_table = pa.Table.from_arrays(pivoted_arrays, schema=pivoted_schema)
+
+        target_arrays = [
+            pa.array(target_columns[field.name], type=field.type)
+            for field in target_schema
+        ]
+        target_table = pa.Table.from_arrays(target_arrays, schema=target_schema)
 
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-        file_name = f"{timestamp}.parquet"
-        pivoted_key = f"{PIVOTED_PREFIX}{file_name}"
+
+        pivoted_key = f"{PIVOTED_PREFIX}{timestamp}.parquet"
+        target_key = f"{TARGET_LOG_RETURNS_PREFIX}{timestamp}.parquet"
+
         s.write_parquet_s3(pivoted_table, BUCKET, pivoted_key, pivoted_schema)
+        s.write_parquet_s3(target_table, BUCKET, target_key, target_schema)
 
         new_last_processed = pivoted_table["localDate"].to_pylist()[-1]
         s.write_json_date_s3(
