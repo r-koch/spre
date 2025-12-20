@@ -54,7 +54,8 @@ MODEL_DIR_OR_NAME = os.getenv(
 RETRY_COUNT = int(os.getenv("RETRY_COUNT", "3"))
 RETRY_DELAY_S = float(os.getenv("RETRY_DELAY_S", "0.25"))
 RETRY_MAX_DELAY_S = float(os.getenv("RETRY_MAX_DELAY_S", "2.0"))
-DEBUG_MAX_DAYS_PER_INVOCATION = int(os.getenv("DEBUG_MAX_DAYS_PER_INVOCATION", "2"))
+DEBUG_MAX_DATE = date.fromisoformat(os.getenv("DEBUG_MAX_DATE", "2000-11-01"))
+DEBUG_MAX_DAYS_PER_INVOCATION = int(os.getenv("DEBUG_MAX_DAYS_PER_INVOCATION", "-1"))
 
 CONFLICT_THRESHOLD_LOW = 0.05
 CONFLICT_THRESHOLD_HIGH = 0.15
@@ -75,7 +76,7 @@ AGGREGATED_PREFIX = "news/aggregated/localDate="
 LAGGED_PREFIX = f"news/lagged-{LAG_DAYS}/"
 
 
-LOGGER = s.setup_logger()
+LOGGER = s.setup_logger(__file__)
 
 ALLOWED_REGEX_PATTERN = re.compile(r"[A-Za-z0-9\p{P}\p{Sc}\s]+")
 
@@ -649,8 +650,11 @@ def generate_lagged_features(context=None):
 
         days_processed = 0
 
-        while s.continue_execution(context):
+        while s.continue_execution(context, MIN_REMAINING_MS, LOGGER):
             if days_processed == DEBUG_MAX_DAYS_PER_INVOCATION:
+                break
+
+            if current_date >= DEBUG_MAX_DATE:
                 break
 
             prev_date = current_date - ONE_DAY

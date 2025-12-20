@@ -26,6 +26,7 @@ def pyarrow_parquet():
 
 
 # ---------- CONFIG ----------
+DEFAULT_COMPRESSION_LEVEL = 1
 DEFAULT_MIN_REMAINING_MS = 60_000
 
 LAST_ADDED_KEY = "lastAdded"
@@ -40,8 +41,8 @@ s3 = boto3.client("s3", region_name=AWS_REGION)
 
 
 # ---------- LOGGING CONFIG ----------
-def setup_logger():
-    logger = logging.getLogger(__name__)
+def setup_logger(name: str):
+    logger = logging.getLogger(name)
     if logger.hasHandlers():
         logger.handlers.clear()
 
@@ -128,7 +129,13 @@ def read_parquet_s3(bucket: str, key: str, schema):
     return retry_s3(op)
 
 
-def write_parquet_s3(table, bucket: str, key: str, schema):
+def write_parquet_s3(
+    table,
+    bucket: str,
+    key: str,
+    schema,
+    compression_level: int = DEFAULT_COMPRESSION_LEVEL,
+):
     if table is None:
         raise ValueError("table must not be None for write_parquet_s3")
 
@@ -142,7 +149,7 @@ def write_parquet_s3(table, bucket: str, key: str, schema):
 
     buffer = BytesIO()
     pyarrow_parquet().write_table(
-        table, buffer, compression="zstd", compression_level=1
+        table, buffer, compression="zstd", compression_level=compression_level
     )
     data = buffer.getvalue()
 

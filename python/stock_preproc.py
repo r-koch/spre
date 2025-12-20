@@ -33,7 +33,8 @@ def pyarrow():
 BUCKET = os.getenv("BUCKET", "dev-rkoch-spre")
 START_DATE = date.fromisoformat(os.getenv("START_DATE", "1999-11-01"))
 MIN_REMAINING_MS = int(os.getenv("MIN_REMAINING_MS", "10000"))
-DEBUG_MAX_DAYS_PER_INVOCATION = int(os.getenv("DEBUG_MAX_DAYS_PER_INVOCATION", "2"))
+DEBUG_MAX_DATE = date.fromisoformat(os.getenv("DEBUG_MAX_DATE", "2000-11-01"))
+DEBUG_MAX_DAYS_PER_INVOCATION = int(os.getenv("DEBUG_MAX_DAYS_PER_INVOCATION", "-1"))
 
 MIN_PRICE = 1e-3
 ONE_DAY = timedelta(days=1)
@@ -47,7 +48,7 @@ RAW_PREFIX = "raw/stock/localDate="
 PIVOTED_PREFIX = "stock/pivoted/"
 TARGET_LOG_RETURNS_PREFIX = "stock/target-log-returns/"
 
-LOGGER = s.setup_logger()
+LOGGER = s.setup_logger(__file__)
 
 # ---------- SCHEMAS ----------
 _raw_schema = None
@@ -318,11 +319,14 @@ def generate_pivoted_features(context=None):
 
         days_processed = 0
 
-        while (
-            s.continue_execution(context, MIN_REMAINING_MS, LOGGER)
-            and current_date <= last_added_date
-        ):
+        while s.continue_execution(context, MIN_REMAINING_MS, LOGGER):
             if days_processed == DEBUG_MAX_DAYS_PER_INVOCATION:
+                break
+
+            if current_date >= DEBUG_MAX_DATE:
+                break
+
+            if current_date > last_added_date:
                 break
 
             curr_closes = append_pivoted_row(pivoted_columns, current_date)
