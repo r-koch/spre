@@ -19,18 +19,16 @@ from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau  # type:
 
 # ---------- CONFIG ----------
 BUCKET = os.getenv("BUCKET", "dev-rkoch-spre")
-LAG_DAYS = int(os.getenv("LAG_DAYS", "5"))
-
-LAG_DAYS = int(os.getenv("LAG_DAYS", "5"))
 VAL_DAYS = int(os.getenv("VAL_DAYS", "30"))
 WINDOW = int(os.getenv("WINDOW", "20"))
 PCA_DIMS = int(os.getenv("PCA_DIMS", "64"))
 BATCH = int(os.getenv("BATCH_SIZE", "128"))
 EPOCHS = int(os.getenv("EPOCHS", "50"))
+CONSOLIDATED_COMPRESSION_LEVEL = int(os.getenv("CONSOLIDATED_COMPRESSION_LEVEL", "3"))
 
-PARTIAL_FILE_LIMIT = int(os.getenv("PARTIAL_FILE_LIMIT", "10"))
+PARTIAL_FILE_LIMIT = int(os.getenv("PARTIAL_FILE_LIMIT", "1"))
 if PARTIAL_FILE_LIMIT < 1:
-    raise ValueError("PARTIAL_FILE_LIMIT must be >= 1")
+    raise ValueError("PARTIAL_FILE_LIMIT must be > 0")
 
 MODEL_PREFIX = "model/localDate="
 MODEL_LOCAL_PREFIX = "/tmp/model/"
@@ -38,6 +36,7 @@ MODEL_LOCAL_PREFIX = "/tmp/model/"
 PCA_FILE_NAME = "/pca.pkl"
 METADATA_FILE_NAME = "/meta.json"
 
+LOGGER = s.setup_logger(__file__)
 
 # ---------- HELPERS ----------
 def write_directory_to_s3(local_dir: str, bucket: str, prefix: str):
@@ -75,7 +74,7 @@ def get_all_keys_and_deduplicated_table(
 ) -> tuple[list[str], pa.Table]:
     keys = s.list_keys_s3(BUCKET, prefix)
     tables = [s.read_parquet_s3(BUCKET, key, schema) for key in keys]
-    combined = pa.concat_tables(tables, promote=False)
+    combined = pa.concat_tables(tables, promote_options="none")
     deduplicated = deduplicate(combined)
     return keys, deduplicated
 
@@ -87,7 +86,7 @@ def consolidate(current_keys: list[str], table: pa.Table, prefix: str, schema):
     timestamp = s.get_now_timestamp()
     new_key = f"{prefix}{timestamp}.parquet"
 
-    s.write_parquet_s3(table, BUCKET, new_key, schema)
+    s.write_parquet_s3(table, BUCKET, new_key, schema, CONSOLIDATED_COMPRESSION_LEVEL)
 
     for key in current_keys:
         s.retry_s3(lambda: s.s3.delete_object(Bucket=BUCKET, Key=key))
@@ -105,9 +104,9 @@ def get_data_frame(prefix: str, schema):
 
 
 def get_training_inputs():
-    stock_data = get_data_frame(sp.PIVOTED_PREFIX, sp.get_pivoted_schema)
-    news_data = get_data_frame(npg.LAGGED_PREFIX, npg.get_lagged_schema)
-    target_data = get_data_frame(sp.TARGET_LOG_RETURNS_PREFIX, sp.get_target_schema)
+    stock_data = get_data_frame(sp.PIVOTED_PREFIX, sp.get_pivoted_schema())
+    news_data = get_data_frame(npg.LAGGED_PREFIX, npg.get_lagged_schema())
+    target_data = get_data_frame(sp.TARGET_LOG_RETURNS_PREFIX, sp.get_target_schema())
 
     common_index = stock_data.index.intersection(news_data.index).intersection(
         target_data.index
@@ -116,9 +115,9 @@ def get_training_inputs():
     if common_index.empty:
         raise ValueError("No overlapping dates across inputs")
 
-    stock_data = stock_data[common_index]
-    news_data = news_data[common_index]
-    target_data = target_data[common_index]
+    stock_data = stock_data.loc[common_index]
+    news_data = news_data.loc[common_index]
+    target_data = target_data.loc[common_index]
 
     if not (
         stock_data.index.equals(news_data.index)
@@ -148,8 +147,8 @@ def get_training_and_validation_mask(index: pd.DatetimeIndex, cutoff_date: date)
 
     if not training_mask.any():
         raise ValueError("Empty training split")
-    if validation_mask.sum() < VAL_DAYS:
-        raise ValueError("Validation split too short")
+    if not validation_mask.any():
+        raise ValueError("Empty validation split")
 
     return training_mask, validation_mask
 
@@ -176,87 +175,90 @@ def build_model(D: int, out_dim: int) -> Model:
 
 
 def train():
-    stock_data, news_data, target_data = get_training_inputs()
+    try:
+        stock_data, news_data, target_data = get_training_inputs()
 
-    cutoff_date = get_cutoff_date()
+        cutoff_date = get_cutoff_date()
 
-    train_mask, val_mask = get_training_and_validation_mask(
-        stock_data.index, cutoff_date
-    )
+        train_mask, val_mask = get_training_and_validation_mask(
+            stock_data.index, cutoff_date
+        )
 
-    X_stock_train = stock_data.loc[train_mask].values
-    X_stock_val = stock_data.loc[val_mask].values
+        X_stock_train = stock_data.loc[train_mask].values
+        X_stock_val = stock_data.loc[val_mask].values
 
-    pca = PCA(n_components=PCA_DIMS)
-    Xp_train = pca.fit_transform(X_stock_train)
-    Xp_val = pca.transform(X_stock_val)
+        pca = PCA(n_components=PCA_DIMS)
+        Xp_train = pca.fit_transform(X_stock_train)
+        Xp_val = pca.transform(X_stock_val)
 
-    X_news_train = news_data.loc[train_mask].values
-    X_news_val = news_data.loc[val_mask].values
+        X_news_train = news_data.loc[train_mask].values
+        X_news_val = news_data.loc[val_mask].values
 
-    X_train = np.hstack([Xp_train, X_news_train])
-    X_val = np.hstack([Xp_val, X_news_val])
+        X_train = np.hstack([Xp_train, X_news_train])
+        X_val = np.hstack([Xp_val, X_news_val])
 
-    Y_train = target_data.loc[train_mask].values
-    Y_val = target_data.loc[val_mask].values
+        Y_train = target_data.loc[train_mask].values
+        Y_val = target_data.loc[val_mask].values
 
-    Xtr_w, Ytr_w = make_windows(X_train, Y_train)
-    Xv_w, Yv_w = make_windows(X_val, Y_val)
+        Xtr_w, Ytr_w = make_windows(X_train, Y_train)
+        Xv_w, Yv_w = make_windows(X_val, Y_val)
 
-    model = build_model(Xtr_w.shape[2], Ytr_w.shape[1])
+        model = build_model(Xtr_w.shape[2], Ytr_w.shape[1])
 
-    model.fit(
-        Xtr_w,
-        Ytr_w,
-        validation_data=(Xv_w, Yv_w),
-        epochs=EPOCHS,
-        batch_size=BATCH,
-        callbacks=[
-            EarlyStopping(patience=6, restore_best_weights=True, monitor="val_loss"),
-            ReduceLROnPlateau(patience=3, factor=0.5, monitor="val_loss"),
-        ],
-    )
+        model.fit(
+            Xtr_w,
+            Ytr_w,
+            validation_data=(Xv_w, Yv_w),
+            epochs=EPOCHS,
+            batch_size=BATCH,
+            callbacks=[
+                EarlyStopping(patience=6, restore_best_weights=True, monitor="val_loss"),
+                ReduceLROnPlateau(patience=3, factor=0.5, monitor="val_loss"),
+            ],
+        )
 
-    date_str = cutoff_date.isoformat()
-    base_prefix = f"{MODEL_PREFIX}{date_str}"
+        date_str = cutoff_date.isoformat()
+        base_prefix = f"{MODEL_PREFIX}{date_str}"
 
-    local_model_dir = f"{MODEL_LOCAL_PREFIX}{date_str}"
-    model.save(local_model_dir)
+        local_model_dir = f"{MODEL_LOCAL_PREFIX}{date_str}"
+        model.export(local_model_dir)
 
-    model_prefix = f"{base_prefix}/model"
-    write_directory_to_s3(local_model_dir, BUCKET, model_prefix)
-    shutil.rmtree(local_model_dir)
+        model_prefix = f"{base_prefix}/model"
+        write_directory_to_s3(local_model_dir, BUCKET, model_prefix)
+        shutil.rmtree(local_model_dir)
 
-    buffer = BytesIO()
-    jl.dump(pca, buffer)
-    buffer.seek(0)
+        buffer = BytesIO()
+        jl.dump(pca, buffer)
+        buffer.seek(0)
 
-    pca_key = f"{base_prefix}{PCA_FILE_NAME}"
-    s.write_bytes_s3(BUCKET, pca_key, buffer.getvalue())
+        pca_key = f"{base_prefix}{PCA_FILE_NAME}"
+        s.write_bytes_s3(BUCKET, pca_key, buffer.getvalue())
 
-    meta = {
-        "cutoff": date_str,
-        "train_range": [
-            str(stock_data.index[train_mask].min()),
-            str(stock_data.index[train_mask].max()),
-        ],
-        "val_range": [
-            str(stock_data.index[val_mask].min()),
-            str(stock_data.index[val_mask].max()),
-        ],
-        "window": WINDOW,
-        "pca_dims": PCA_DIMS,
-        "lag_days": LAG_DAYS,
-        "features": {
-            "price_features": stock_data.shape[1],
-            "news_features": news_data.shape[1],
-        },
-    }
-    meta_bytes = json.dumps(meta, indent=2).encode("utf-8")
+        meta = {
+            "cutoff": date_str,
+            "train_range": [
+                str(stock_data.index[train_mask].min()),
+                str(stock_data.index[train_mask].max()),
+            ],
+            "val_range": [
+                str(stock_data.index[val_mask].min()),
+                str(stock_data.index[val_mask].max()),
+            ],
+            "window": WINDOW,
+            "pca_dims": PCA_DIMS,
+            "features": {
+                "price_features": stock_data.shape[1],
+                "news_features": news_data.shape[1],
+            },
+        }
+        meta_bytes = json.dumps(meta, indent=2).encode("utf-8")
 
-    meta_key = f"{base_prefix}{METADATA_FILE_NAME}"
-    s.write_bytes_s3(BUCKET, meta_key, meta_bytes)
+        meta_key = f"{base_prefix}{METADATA_FILE_NAME}"
+        s.write_bytes_s3(BUCKET, meta_key, meta_bytes)
 
+    except Exception:
+        LOGGER.exception("Error in train")
+        return {"statusCode": 500, "body": "error"}
 
 # ---------- ENTRY POINT ----------
 if __name__ == "__main__":
