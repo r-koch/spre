@@ -4,7 +4,7 @@ import logging
 import os
 import random
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
 from typing import cast, overload
 
@@ -28,9 +28,23 @@ def pyarrow_parquet():
 # ---------- CONFIG ----------
 DEFAULT_COMPRESSION_LEVEL = 1
 DEFAULT_MIN_REMAINING_MS = 60_000
+ONE_DAY = timedelta(days=1)
 
 LAST_ADDED_KEY = "lastAdded"
 LAST_PROCESSED_KEY = "lastProcessed"
+LAST_TRAINED_KEY = "lastTrained"
+
+META_DATA = "metadata/"
+NEWS_COLLECTOR_STATE_KEY = f"{META_DATA}news_collector_state.json"
+NEWS_PREPROC_STATE_KEY = f"{META_DATA}news_preproc_state.json"
+STOCK_COLLECTOR_STATE_KEY = f"{META_DATA}stock_collector_state.json"
+STOCK_PREPROC_STATE_KEY = f"{META_DATA}stock_preproc_state.json"
+TRAINING_STATE_KEY = f"{META_DATA}training_state.json"
+
+MODEL_PREFIX = "model/localDate="
+MODEL_FILE_NAME = "model.keras"
+PCA_FILE_NAME = "pca.pkl"
+META_FILE_NAME = "meta.json"
 
 AWS_REGION = os.getenv("AWS_REGION", "eu-west-1")
 RETRY_COUNT = int(os.getenv("RETRY_COUNT", "3"))
@@ -111,36 +125,30 @@ def retry_s3(
 
 
 def read_parquet_s3(bucket: str, key: str, schema):
-    def op():
-        s3_object = s3.get_object(Bucket=bucket, Key=key)
-        buffer = BytesIO(s3_object["Body"].read())
-        try:
-            table = pyarrow_parquet().read_table(buffer, columns=schema.names)
-        except Exception as e:
-            raise ValueError(f"Corrupted parquet at {key}: {e}")
+    data = read_bytes_s3(bucket, key)
+    buffer = BytesIO(data)
+    try:
+        table = pyarrow_parquet().read_table(buffer, columns=schema.names)
+    except Exception as e:
+        raise ValueError(f"Corrupted parquet at {key}: {e}")
 
-        if schema_mismatch(schema, table.schema):
-            raise ValueError(
-                f"Schema mismatch for {key}. Expected {schema}, got {table.schema}"
-            )
+    if schema_mismatch(schema, table.schema):
+        raise ValueError(
+            f"Schema mismatch for {key}. Expected {schema}, got {table.schema}"
+        )
 
-        return table
-
-    return retry_s3(op)
+    return table
 
 
 def write_parquet_s3(
-    table,
     bucket: str,
     key: str,
+    table,
     schema,
     compression_level: int = DEFAULT_COMPRESSION_LEVEL,
 ):
-    if table is None:
-        raise ValueError("table must not be None for write_parquet_s3")
-
-    if schema is None:
-        raise ValueError("Schema must not be None for write_parquet_s3")
+    assert table is not None
+    assert schema is not None
 
     if schema_mismatch(schema, table.schema):
         raise ValueError(
@@ -153,7 +161,7 @@ def write_parquet_s3(
     )
     data = buffer.getvalue()
 
-    retry_s3(lambda: s3.put_object(Bucket=bucket, Key=key, Body=data))
+    write_bytes_s3(bucket, key, data)
 
 
 def schema_mismatch(expected, actual) -> bool:
@@ -179,13 +187,10 @@ def read_json_date_s3(
 
 
 def read_json_date_s3(bucket: str, s3_key: str, json_key: str, default_value=None):
-    def op():
-        s3_object = s3.get_object(Bucket=bucket, Key=s3_key)
-        data = json.loads(s3_object["Body"].read().decode("utf-8"))
-        return datetime.strptime(data[json_key], "%Y-%m-%d").date()
-
     try:
-        return cast(date, retry_s3(op))
+        data = read_bytes_s3(bucket, s3_key)
+        json_str = json.loads(data.decode("utf-8"))
+        return date.fromisoformat(json_str[json_key])
     except ClientError as e:
         if e.response.get("Error", {}).get("Code", "") == "NoSuchKey":
             return default_value
@@ -193,16 +198,9 @@ def read_json_date_s3(bucket: str, s3_key: str, json_key: str, default_value=Non
 
 
 def write_json_date_s3(bucket: str, s3_key: str, json_key: str, value: date):
-    def op():
-        payload = {json_key: value.isoformat()}
-        s3.put_object(
-            Bucket=bucket,
-            Key=s3_key,
-            Body=json.dumps(payload).encode("utf-8"),
-            ContentType="application/json",
-        )
-
-    retry_s3(op)
+    payload = {json_key: value.isoformat()}
+    data = json.dumps(payload).encode("utf-8")
+    write_bytes_s3(bucket, s3_key, data)
 
 
 def list_keys_s3(bucket: str, prefix: str, sort_reversed: bool = False) -> list:
@@ -222,11 +220,40 @@ def get_now_timestamp() -> str:
 
 
 def write_bytes_s3(bucket: str, key: str, data: bytes):
-    def op():
-        s3.put_object(
-            Bucket=bucket,
-            Key=key,
-            Body=data,
-        )
+    retry_s3(lambda: s3.put_object(Bucket=bucket, Key=key, Body=data))
 
-    retry_s3(op)
+
+def read_bytes_s3(bucket: str, key: str) -> bytes:
+    return cast(
+        bytes, retry_s3(lambda: s3.get_object(Bucket=bucket, Key=key)["Body"].read())
+    )
+
+
+def get_last_processed_date(bucket: str) -> date:
+    stock_last = read_json_date_s3(bucket, STOCK_PREPROC_STATE_KEY, LAST_PROCESSED_KEY)
+    assert stock_last is not None
+    news_last = read_json_date_s3(bucket, NEWS_PREPROC_STATE_KEY, LAST_PROCESSED_KEY)
+    assert news_last is not None
+    return min(stock_last, news_last)
+
+
+def write_directory_s3(bucket: str, prefix: str, local_dir: str):
+    for root, _, files in os.walk(local_dir):
+        for fname in files:
+            local_path = os.path.join(root, fname)
+            rel_path = os.path.relpath(local_path, local_dir)
+            key = f"{prefix}/{rel_path}"
+
+            with open(local_path, "rb") as reader:
+                data = reader.read()
+                write_bytes_s3(bucket, key, data)
+
+
+def read_directory_s3(bucket: str, prefix: str, local_dir: str):
+    os.makedirs(local_dir, exist_ok=True)
+    for key in list_keys_s3(bucket, prefix):
+        rel = key[len(prefix) :].lstrip("/")
+        path = os.path.join(local_dir, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(read_bytes_s3(bucket, key))

@@ -1,12 +1,12 @@
 # ---------- STANDARD LIBRARY ----------
 import json
 import os
-import shutil
+import pickle
+import tempfile
 from datetime import date
 from io import BytesIO
 
 # ---------- THIRD-PARTY LIBRARIES ----------
-import joblib as jl
 import news_preproc as npg
 import numpy as np
 import pandas as pd
@@ -30,30 +30,12 @@ PARTIAL_FILE_LIMIT = int(os.getenv("PARTIAL_FILE_LIMIT", "1"))
 if PARTIAL_FILE_LIMIT < 1:
     raise ValueError("PARTIAL_FILE_LIMIT must be > 0")
 
-MODEL_PREFIX = "model/localDate="
 MODEL_LOCAL_PREFIX = "/tmp/model/"
-
-PCA_FILE_NAME = "/pca.pkl"
-METADATA_FILE_NAME = "/meta.json"
 
 LOGGER = s.setup_logger(__file__)
 
+
 # ---------- HELPERS ----------
-def write_directory_to_s3(local_dir: str, bucket: str, prefix: str):
-    for root, _, files in os.walk(local_dir):
-        for fname in files:
-            local_path = os.path.join(root, fname)
-            rel_path = os.path.relpath(local_path, local_dir)
-            key = f"{prefix}/{rel_path}"
-
-            with open(local_path, "rb") as reader:
-                s.retry_s3(
-                    lambda body=reader.read(): s.s3.put_object(
-                        Bucket=bucket, Key=key, Body=body
-                    )
-                )
-
-
 def deduplicate(table):
     seen = set()
     keep_indices: list[int] = []
@@ -86,7 +68,7 @@ def consolidate(current_keys: list[str], table: pa.Table, prefix: str, schema):
     timestamp = s.get_now_timestamp()
     new_key = f"{prefix}{timestamp}.parquet"
 
-    s.write_parquet_s3(table, BUCKET, new_key, schema, CONSOLIDATED_COMPRESSION_LEVEL)
+    s.write_parquet_s3(BUCKET, new_key, table, schema, CONSOLIDATED_COMPRESSION_LEVEL)
 
     for key in current_keys:
         s.retry_s3(lambda: s.s3.delete_object(Bucket=BUCKET, Key=key))
@@ -129,11 +111,7 @@ def get_training_inputs():
 
 
 def get_cutoff_date() -> date:
-    stock_last = s.read_json_date_s3(BUCKET, sp.PREPROC_STATE_KEY, s.LAST_PROCESSED_KEY)
-    assert stock_last is not None
-    news_last = s.read_json_date_s3(BUCKET, npg.PREPROC_STATE_KEY, s.LAST_PROCESSED_KEY)
-    assert news_last is not None
-    return min(stock_last, news_last)
+    return s.get_last_processed_date(BUCKET)
 
 
 def get_training_and_validation_mask(index: pd.DatetimeIndex, cutoff_date: date):
@@ -212,53 +190,63 @@ def train():
             epochs=EPOCHS,
             batch_size=BATCH,
             callbacks=[
-                EarlyStopping(patience=6, restore_best_weights=True, monitor="val_loss"),
+                EarlyStopping(
+                    patience=6, restore_best_weights=True, monitor="val_loss"
+                ),
                 ReduceLROnPlateau(patience=3, factor=0.5, monitor="val_loss"),
             ],
         )
 
-        date_str = cutoff_date.isoformat()
-        base_prefix = f"{MODEL_PREFIX}{date_str}"
+        model_date = cutoff_date.isoformat()
+        base_prefix = f"{s.MODEL_PREFIX}{model_date}/"
 
-        local_model_dir = f"{MODEL_LOCAL_PREFIX}{date_str}"
-        model.export(local_model_dir)
+        with tempfile.TemporaryDirectory() as tmp:
+            local_model_path = os.path.join(tmp, s.MODEL_FILE_NAME)
+            model.save(local_model_path)
 
-        model_prefix = f"{base_prefix}/model"
-        write_directory_to_s3(local_model_dir, BUCKET, model_prefix)
-        shutil.rmtree(local_model_dir)
+            with open(local_model_path, "rb") as f:
+                model_data = f.read()
+
+            model_key = f"{base_prefix}{s.MODEL_FILE_NAME}"
+            s.write_bytes_s3(BUCKET, model_key, model_data)
 
         buffer = BytesIO()
-        jl.dump(pca, buffer)
-        buffer.seek(0)
+        pickle.dump(pca, buffer, protocol=pickle.HIGHEST_PROTOCOL)
+        pca_data = buffer.getvalue()
 
-        pca_key = f"{base_prefix}{PCA_FILE_NAME}"
-        s.write_bytes_s3(BUCKET, pca_key, buffer.getvalue())
+        pca_key = f"{base_prefix}{s.PCA_FILE_NAME}"
+        s.write_bytes_s3(BUCKET, pca_key, pca_data)
 
         meta = {
-            "cutoff": date_str,
-            "train_range": [
+            "trainingCutoff": model_date,
+            "trainingRange": [
                 str(stock_data.index[train_mask].min()),
                 str(stock_data.index[train_mask].max()),
             ],
-            "val_range": [
+            "validationRange": [
                 str(stock_data.index[val_mask].min()),
                 str(stock_data.index[val_mask].max()),
             ],
-            "window": WINDOW,
-            "pca_dims": PCA_DIMS,
+            "windowSize": WINDOW,
+            "pcaDimensions": PCA_DIMS,
             "features": {
-                "price_features": stock_data.shape[1],
-                "news_features": news_data.shape[1],
+                "stock": stock_data.shape[1],
+                "news": news_data.shape[1],
             },
         }
-        meta_bytes = json.dumps(meta, indent=2).encode("utf-8")
+        meta_data = json.dumps(meta, indent=2).encode("utf-8")
 
-        meta_key = f"{base_prefix}{METADATA_FILE_NAME}"
-        s.write_bytes_s3(BUCKET, meta_key, meta_bytes)
+        meta_key = f"{base_prefix}{s.META_FILE_NAME}"
+        s.write_bytes_s3(BUCKET, meta_key, meta_data)
+
+        s.write_json_date_s3(
+            BUCKET, s.TRAINING_STATE_KEY, s.LAST_TRAINED_KEY, cutoff_date
+        )
 
     except Exception:
         LOGGER.exception("Error in train")
         return {"statusCode": 500, "body": "error"}
+
 
 # ---------- ENTRY POINT ----------
 if __name__ == "__main__":

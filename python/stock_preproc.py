@@ -1,6 +1,6 @@
 # ---------- STANDARD LIBRARY ----------
 import os
-from datetime import date, timedelta
+from datetime import date
 
 # ---------- THIRD-PARTY LIBRARIES ----------
 import shared as s
@@ -33,15 +33,12 @@ def pyarrow():
 BUCKET = os.getenv("BUCKET", "dev-rkoch-spre")
 START_DATE = date.fromisoformat(os.getenv("START_DATE", "1999-11-01"))
 MIN_REMAINING_MS = int(os.getenv("MIN_REMAINING_MS", "10000"))
+
 DEBUG_MAX_DATE = date.fromisoformat(os.getenv("DEBUG_MAX_DATE", "2000-11-01"))
 DEBUG_MAX_DAYS_PER_INVOCATION = int(os.getenv("DEBUG_MAX_DAYS_PER_INVOCATION", "-1"))
 
 MIN_PRICE = 1e-3
-ONE_DAY = timedelta(days=1)
 
-META_DATA = "metadata/"
-COLLECTOR_STATE_KEY = f"{META_DATA}stock_collector_state.json"
-PREPROC_STATE_KEY = f"{META_DATA}stock_preproc_state.json"
 SYMBOLS_KEY = "symbols/spx.parquet"
 
 RAW_PREFIX = "raw/stock/localDate="
@@ -95,8 +92,7 @@ def get_symbols():
     global _symbols
     if _symbols is None:
         symbols_table = s.read_parquet_s3(BUCKET, SYMBOLS_KEY, get_symbols_schema())
-        if symbols_table is None:
-            raise ValueError("symbols_table is None")
+        assert symbols_table is not None
         _symbols = symbols_table.column("id").to_pylist()
     return _symbols
 
@@ -295,19 +291,22 @@ def append_target_row(
 def generate_pivoted_features(context=None):
     try:
         last_added_date = s.read_json_date_s3(
-            BUCKET, COLLECTOR_STATE_KEY, s.LAST_ADDED_KEY
+            BUCKET, s.STOCK_COLLECTOR_STATE_KEY, s.LAST_ADDED_KEY
         )
         if last_added_date is None:
             return {"statusCode": 200, "body": "no raw data to process"}
 
-        default_last_processed_date = START_DATE - ONE_DAY
+        default_last_processed_date = START_DATE - s.ONE_DAY
         last_processed_date = s.read_json_date_s3(
-            BUCKET, PREPROC_STATE_KEY, s.LAST_PROCESSED_KEY, default_last_processed_date
+            BUCKET,
+            s.STOCK_PREPROC_STATE_KEY,
+            s.LAST_PROCESSED_KEY,
+            default_last_processed_date,
         )
         if last_processed_date >= last_added_date:
             return {"statusCode": 200, "body": "all data already processed"}
 
-        current_date = last_processed_date + ONE_DAY
+        current_date = last_processed_date + s.ONE_DAY
 
         pivoted_schema = get_pivoted_schema()
         pivoted_columns = {field.name: [] for field in pivoted_schema}
@@ -339,7 +338,7 @@ def generate_pivoted_features(context=None):
                 days_processed += 1
 
             LOGGER.info(f"Computed pivoted + target features for {current_date}")
-            current_date += ONE_DAY
+            current_date += s.ONE_DAY
 
         if days_processed == 0:
             return {
@@ -365,12 +364,12 @@ def generate_pivoted_features(context=None):
         pivoted_key = f"{PIVOTED_PREFIX}{timestamp}.parquet"
         target_key = f"{TARGET_LOG_RETURNS_PREFIX}{timestamp}.parquet"
 
-        s.write_parquet_s3(pivoted_table, BUCKET, pivoted_key, pivoted_schema)
-        s.write_parquet_s3(target_table, BUCKET, target_key, target_schema)
+        s.write_parquet_s3(BUCKET, pivoted_key, pivoted_table, pivoted_schema)
+        s.write_parquet_s3(BUCKET, target_key, target_table, target_schema)
 
         new_last_processed = pivoted_table["localDate"].to_pylist()[-1]
         s.write_json_date_s3(
-            BUCKET, PREPROC_STATE_KEY, s.LAST_PROCESSED_KEY, new_last_processed
+            BUCKET, s.STOCK_PREPROC_STATE_KEY, s.LAST_PROCESSED_KEY, new_last_processed
         )
 
         return {

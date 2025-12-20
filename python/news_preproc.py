@@ -2,7 +2,7 @@
 import os
 import unicodedata
 from collections import deque
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, timedelta
 
 # ---------- THIRD-PARTY LIBRARIES ----------
 import regex as re
@@ -61,13 +61,9 @@ CONFLICT_THRESHOLD_LOW = 0.05
 CONFLICT_THRESHOLD_HIGH = 0.15
 EXTREME_THRESHOLD = 0.5
 NEUTRAL_THRESHOLD = 0.1
-ONE_DAY = timedelta(days=1)
 PREVENT_DIV_BY_ZERO = 1e-9
 TOKENIZER_MAX_LENGTH = 512
 
-META_DATA = "metadata/"
-COLLECTOR_STATE_KEY = f"{META_DATA}news_collector_state.json"
-PREPROC_STATE_KEY = f"{META_DATA}news_preproc_state.json"
 
 TEMP_PREFIX = "tmp/"
 RAW_PREFIX = "raw/news/localDate="
@@ -381,8 +377,7 @@ def get_sentiment(py_date: date):
             return None
         raise
 
-    if raw_table is None:
-        raise ValueError("raw_table is None")
+    assert raw_table is not None
 
     row_count = raw_table.num_rows
     if row_count == 0:
@@ -462,7 +457,7 @@ def get_sentiment(py_date: date):
             token_counts[from_index:to_index] = batch_token_counts
 
     pa = pyarrow()
-    table = pa.Table.from_arrays(
+    sentiment_table = pa.Table.from_arrays(
         [
             pa.repeat(pa.scalar(py_date, type=pa.date32()), row_count),
             raw_table["id"],
@@ -473,8 +468,8 @@ def get_sentiment(py_date: date):
         names=sentiment_schema.names,
     )
 
-    s.write_parquet_s3(table, BUCKET, sentiment_key, sentiment_schema)
-    return table
+    s.write_parquet_s3(BUCKET, sentiment_key, sentiment_table, sentiment_schema)
+    return sentiment_table
 
 
 def get_aggregated(py_date: date) -> dict[str, float]:
@@ -485,8 +480,7 @@ def get_aggregated(py_date: date) -> dict[str, float]:
 
     try:
         aggregated_table = s.read_parquet_s3(BUCKET, aggregated_key, aggregated_schema)
-        if aggregated_table is None:
-            raise ValueError("aggregated_table is None")
+        assert aggregated_table is not None
         return {
             column_name: aggregated_table[column_name][0].as_py()
             for column_name in aggregated_columns
@@ -578,7 +572,7 @@ def get_aggregated(py_date: date) -> dict[str, float]:
             )
 
             s.write_parquet_s3(
-                aggregated_table, BUCKET, aggregated_key, aggregated_schema
+                BUCKET, aggregated_key, aggregated_table, aggregated_schema
             )
 
             aggregated_values = [
@@ -620,21 +614,24 @@ def append_lagged_row(
 def generate_lagged_features(context=None):
     try:
         last_added_date = s.read_json_date_s3(
-            BUCKET, COLLECTOR_STATE_KEY, s.LAST_ADDED_KEY
+            BUCKET, s.NEWS_COLLECTOR_STATE_KEY, s.LAST_ADDED_KEY
         )
         if last_added_date is None:
             return {"statusCode": 200, "body": "no raw data to process"}
 
-        default_last_processed_date = START_DATE - ONE_DAY
+        default_last_processed_date = START_DATE - s.ONE_DAY
         last_processed_date = s.read_json_date_s3(
-            BUCKET, PREPROC_STATE_KEY, s.LAST_PROCESSED_KEY, default_last_processed_date
+            BUCKET,
+            s.NEWS_PREPROC_STATE_KEY,
+            s.LAST_PROCESSED_KEY,
+            default_last_processed_date,
         )
         if last_processed_date > last_added_date:
             return {"statusCode": 200, "body": "all data already processed"}
 
         init_torch()
 
-        current_date = last_processed_date + ONE_DAY
+        current_date = last_processed_date + s.ONE_DAY
 
         rolling_window = deque(maxlen=LAG_DAYS)
         for i in range(LAG_DAYS, 1, -1):
@@ -657,7 +654,7 @@ def generate_lagged_features(context=None):
             if current_date >= DEBUG_MAX_DATE:
                 break
 
-            prev_date = current_date - ONE_DAY
+            prev_date = current_date - s.ONE_DAY
             if prev_date > last_added_date:
                 break
 
@@ -672,7 +669,7 @@ def generate_lagged_features(context=None):
             )
             days_processed += 1
             LOGGER.info(f"Computed lagged features for {current_date}")
-            current_date += ONE_DAY
+            current_date += s.ONE_DAY
 
         if days_processed == 0:
             return {
@@ -690,11 +687,11 @@ def generate_lagged_features(context=None):
         timestamp = s.get_now_timestamp()
         lagged_key = f"{LAGGED_PREFIX}{timestamp}.parquet"
 
-        s.write_parquet_s3(lagged_table, BUCKET, lagged_key, lagged_schema)
+        s.write_parquet_s3(BUCKET, lagged_key, lagged_table, lagged_schema)
 
         new_last_processed = lagged_table["localDate"].to_pylist()[-1]
         s.write_json_date_s3(
-            BUCKET, PREPROC_STATE_KEY, s.LAST_PROCESSED_KEY, new_last_processed
+            BUCKET, s.NEWS_PREPROC_STATE_KEY, s.LAST_PROCESSED_KEY, new_last_processed
         )
 
         return {
