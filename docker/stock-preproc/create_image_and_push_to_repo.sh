@@ -3,7 +3,7 @@
 # Variables
 ACCOUNT_ID=$(aws sts get-caller-identity --query "Account" --output text)
 REGION=eu-west-1
-REPO_NAME=spre-news-preproc
+REPO_NAME=spre-stock-preproc
 
 # 1. Authenticate Docker with ECR
 aws ecr get-login-password --region $REGION | \
@@ -13,7 +13,7 @@ docker login --username AWS --password-stdin $ACCOUNT_ID.dkr.ecr.$REGION.amazona
 aws ecr create-repository --repository-name $REPO_NAME --region $REGION || true
 
 # 3. Build and tag image
-docker build -f docker/news-preproc/Dockerfile -t $REPO_NAME .
+docker build -f docker/stock-preproc/Dockerfile -t $REPO_NAME .
 
 # 4. Tag for ECR
 docker tag $REPO_NAME:latest $ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/$REPO_NAME:latest
