@@ -192,6 +192,7 @@ def write_json_date_s3(bucket: str, s3_key: str, json_key: str, value: date):
             Bucket=bucket,
             Key=s3_key,
             Body=json.dumps(payload).encode("utf-8"),
+            ContentType="application/json",
         )
 
     retry_s3(op)
@@ -211,3 +212,14 @@ def list_keys_s3(bucket: str, prefix: str, sort_reversed: bool = False) -> list:
 
 def get_now_timestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+
+def write_bytes_s3(bucket: str, key: str, data: bytes):
+    def op():
+        s3.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=data,
+        )
+
+    retry_s3(op)
