@@ -112,7 +112,8 @@ public class NasdaqApi {
       return records;
     } catch (SymbolNotFoundException e) {
       if (Symbol.IPG.name().equalsIgnoreCase(symbol)) {
-        // after 2025-11-21 delisted
+        return getEmptyRecords(symbol);
+      } else if (Symbol.K.name().equalsIgnoreCase(symbol)) {
         return getEmptyRecords(symbol);
       } else {
         e.setSymbol(symbol);
