@@ -108,7 +108,7 @@ def build_model_input(
 
 
 def infer():
-    last_processed_date = s.get_last_processed_date(BUCKET) - s.ONE_DAY # TODO remove after tryout!!!
+    last_processed_date = s.get_last_processed_date(BUCKET)
     inference_date = last_processed_date + s.ONE_DAY
 
     model_prefix = get_model_prefix()
