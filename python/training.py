@@ -1,151 +1,221 @@
-# ---------- STANDARD ----------
+# ---------- STANDARD LIBRARY ----------
 import os
 from typing import Iterable
-import pandas as pd
-import numpy as np
+from datetime import date, timedelta
 
-# ---------- PROJECT SHARED ----------
+# ---------- THIRD-PARTY LIBRARIES ----------
+import joblib as jl
+import news_preproc as npg
+import numpy as np
+import pandas as pd
+import pyarrow as pa
 import shared as s
-import stock_preproc as sp   # schemas + prefixes
-import news_preproc as npg   # schemas + prefixes
+import stock_preproc as sp
+from sklearn.decomposition import PCA
+from tensorflow.keras import layers, Model, Input  # type: ignore
+from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau  # type: ignore
 
 # ---------- CONFIG ----------
 BUCKET = os.getenv("BUCKET", "dev-rkoch-spre")
 LAG_DAYS = int(os.getenv("LAG_DAYS", "5"))
 
-PIVOTED_PREFIX = sp.PIVOTED_PREFIX
-TARGET_PREFIX  = sp.TARGET_LOG_RETURNS_PREFIX
-LAGGED_PREFIX  = npg.LAGGED_PREFIX
+LAG_DAYS = int(os.getenv("LAG_DAYS", "5"))
+VAL_DAYS = int(os.getenv("VAL_DAYS", "30"))
+WINDOW = int(os.getenv("WINDOW", "20"))
+PCA_DIMS = int(os.getenv("PCA_DIMS", "64"))
+BATCH = int(os.getenv("BATCH_SIZE", "128"))
+EPOCHS = int(os.getenv("EPOCHS", "50"))
 
-# consolidated files written to SAME prefix
-PIVOTED_CONSOLIDATED_KEY = f"{PIVOTED_PREFIX}__consolidated__.parquet"
-TARGET_CONSOLIDATED_KEY  = f"{TARGET_PREFIX}__consolidated__.parquet"
+PARTIAL_FILE_LIMIT = int(os.getenv("PARTIAL_FILE_LIMIT", "10"))
+if PARTIAL_FILE_LIMIT < 1:
+    raise ValueError("PARTIAL_FILE_LIMIT must be >= 1")
+
+PCA_PATH_TEMPLATE = "artifacts/pca_{cutoff}.pkl"
+MODEL_PATH_TEMPLATE = "artifacts/model_{cutoff}.h5"
+METADATA_TEMPLATE = "artifacts/meta_{cutoff}.json"
 
 
 # ---------- HELPERS ----------
-def _read_all_tables(prefix: str, schema):
+def deduplicate(table):
+    seen = set()
+    keep_indices: list[int] = []
+
+    dates = table["localDate"]
+    for i in range(table.num_rows - 1, -1, -1):
+        d = dates[i].as_py()
+        if d not in seen:
+            seen.add(d)
+            keep_indices.append(i)
+
+    keep_indices.reverse()
+    return table.take(pa.array(keep_indices))
+
+
+def get_all_keys_and_deduplicated_table(
+    prefix: str, schema
+) -> tuple[list[str], pa.Table]:
     keys = s.list_keys_s3(BUCKET, prefix)
-    tables = []
-    for k in keys:
-        tables.append((k, s.read_parquet_s3(BUCKET, k, schema)))
-    return keys, tables
+    tables = [s.read_parquet_s3(BUCKET, key, schema) for key in keys]
+    combined = pa.concat_tables(tables, promote=False)
+    deduplicated = deduplicate(combined)
+    return keys, deduplicated
 
 
-def _tables_to_df(tables, drop_cols: Iterable[str] = ()):
-    # concat tables to pandas, keep localDate
-    dfs = []
-    for _, t in tables:
-        df = t.to_pandas()
-        dfs.append(df)
-    df = pd.concat(dfs, ignore_index=True)
-    for c in drop_cols:
-        if c in df.columns:
-            df = df.drop(columns=c)
-    return df
+def consolidate(current_keys: list[str], table: pa.Table, prefix: str, schema):
+    if len(current_keys) <= PARTIAL_FILE_LIMIT:
+        return
+
+    timestamp = s.get_now_timestamp()
+    new_key = f"{prefix}{timestamp}.parquet"
+
+    s.write_parquet_s3(table, BUCKET, new_key, schema)
+
+    for key in current_keys:
+        s.retry_s3(lambda: s.s3.delete_object(Bucket=BUCKET, Key=key))
 
 
-def _dedup_last_wins(df: pd.DataFrame):
-    # assumes 'localDate' exists
-    df = df.sort_values("localDate", kind="stable")
-    # keep last occurrence of each localDate
-    return df.drop_duplicates(subset=["localDate"], keep="last")
+def get_data_frame(prefix: str, schema):
+    keys, table = get_all_keys_and_deduplicated_table(prefix, schema)
 
+    consolidate(keys, table, prefix, schema)
 
-def _to_indexed(df: pd.DataFrame):
+    df = table.to_pandas()
     df["localDate"] = pd.to_datetime(df["localDate"])
     df = df.set_index("localDate").sort_index()
-    if not df.index.is_monotonic_increasing:
-        raise ValueError("Index not strictly increasing after sort")
-    if df.index.has_duplicates:
-        raise ValueError("Duplicates remain after dedup")
     return df
 
 
-def _write_consolidated_and_cleanup(consolidated_key: str, schema, df: pd.DataFrame, keys_to_delete: list[str]):
-    # write
-    import pyarrow as pa
-    table = pa.Table.from_pandas(df.reset_index(), schema=schema, preserve_index=False)
-    s.write_parquet_s3(table, BUCKET, consolidated_key, schema)
-    # delete partials
-    for k in keys_to_delete:
-        s.retry_s3(lambda: s.s3.delete_object(Bucket=BUCKET, Key=k))
+def get_training_inputs():
+    stock_data = get_data_frame(sp.PIVOTED_PREFIX, sp.get_pivoted_schema)
+    news_data = get_data_frame(npg.LAGGED_PREFIX, npg.get_lagged_schema)
+    target_data = get_data_frame(sp.TARGET_LOG_RETURNS_PREFIX, sp.get_target_schema)
 
-
-# ---------- LOADERS ----------
-def load_pivoted_df_price_flat(consolidate: bool = True) -> pd.DataFrame:
-    schema = sp.get_pivoted_schema()
-    keys, tables = _read_all_tables(PIVOTED_PREFIX, schema)
-
-    # pandas
-    df = _tables_to_df(tables)
-    # dedup last-wins
-    df = _dedup_last_wins(df)
-    # index
-    df = _to_indexed(df)
-    # drop index col
-    df_price_flat = df.drop(columns=["localDate"], errors="ignore")
-
-    if consolidate:
-        _write_consolidated_and_cleanup(
-            PIVOTED_CONSOLIDATED_KEY, schema, df, keys
-        )
-    return df_price_flat
-
-
-def load_returns_y(consolidate: bool = True) -> pd.DataFrame:
-    schema = sp.get_target_schema()
-    keys, tables = _read_all_tables(TARGET_PREFIX, schema)
-
-    df = _tables_to_df(tables)
-    df = _dedup_last_wins(df)
-    df = _to_indexed(df)
-    returns_y = df.drop(columns=["localDate"], errors="ignore")
-
-    if consolidate:
-        _write_consolidated_and_cleanup(
-            TARGET_CONSOLIDATED_KEY, schema, df, keys
-        )
-    return returns_y
-
-
-def load_news_features() -> pd.DataFrame:
-    # no dedup, no consolidation
-    schema = npg.get_lagged_schema()
-    keys, tables = _read_all_tables(LAGGED_PREFIX, schema)
-
-    df = _tables_to_df(tables)
-    df = _to_indexed(df)
-    news_features = df.drop(columns=["localDate"], errors="ignore")
-    return news_features
-
-
-# ---------- ALIGNMENT ----------
-def load_aligned_training_inputs(consolidate_prices_and_targets: bool = True):
-    df_price_flat = load_pivoted_df_price_flat(consolidate_prices_and_targets)
-    news_features = load_news_features()
-    returns_y     = load_returns_y(consolidate_prices_and_targets)
-
-    common = (
-        df_price_flat.index
-        .intersection(news_features.index)
-        .intersection(returns_y.index)
+    common_index = stock_data.index.intersection(news_data.index).intersection(
+        target_data.index
     )
 
+    if common_index.empty:
+        raise ValueError("No overlapping dates across inputs")
+
+    stock_data = stock_data[common_index]
+    news_data = news_data[common_index]
+    target_data = target_data[common_index]
+
     if not (
-        common.equals(df_price_flat.index)
-        and common.equals(news_features.index)
-        and common.equals(returns_y.index)
+        stock_data.index.equals(news_data.index)
+        and stock_data.index.equals(target_data.index)
     ):
-        raise ValueError("Hard fail: index misalignment across inputs")
+        raise ValueError("Hard fail: misaligned indices")
 
-    return df_price_flat, news_features, returns_y
+    return stock_data, news_data, target_data
 
 
-# ---------- INTEGRATION POINT ----------
-# Use this at the top of your monthly retrain job:
-#
-# df_price_flat, news_features, returns_y = load_aligned_training_inputs(
-#     consolidate_prices_and_targets=True
-# )
-#
-# ... then proceed with PCA fit (train split only), windowing, and model.fit()
+def get_cutoff_date() -> date:
+    stock_last = s.read_json_date_s3(BUCKET, sp.PREPROC_STATE_KEY, s.LAST_PROCESSED_KEY)
+    assert stock_last is not None
+    news_last = s.read_json_date_s3(BUCKET, npg.PREPROC_STATE_KEY, s.LAST_PROCESSED_KEY)
+    assert news_last is not None
+    return min(stock_last, news_last)
+
+
+def get_training_and_validation_mask(index: pd.DatetimeIndex, cutoff_date: date):
+    cutoff = pd.Timestamp(cutoff_date)
+
+    val_end = cutoff
+    val_start = cutoff - pd.Timedelta(days=VAL_DAYS - 1)
+
+    training_mask = index < val_start
+    validation_mask = (index >= val_start) & (index <= val_end)
+
+    if not training_mask.any():
+        raise ValueError("Empty training split")
+    if validation_mask.sum() < VAL_DAYS:
+        raise ValueError("Validation split too short")
+
+    return training_mask, validation_mask
+
+
+def make_windows(X: np.ndarray, Y: np.ndarray):
+    xs, ys = [], []
+    for i in range(WINDOW, len(X)):
+        xs.append(X[i - WINDOW : i])
+        ys.append(Y[i])
+    return np.asarray(xs), np.asarray(ys)
+
+
+def build_model(D: int, out_dim: int) -> Model:
+    inp = Input((WINDOW, D))
+    x = layers.Conv1D(64, 3, padding="causal", activation="relu")(inp)
+    x = layers.Conv1D(64, 3, padding="causal", activation="relu")(x)
+    x = layers.Bidirectional(layers.LSTM(128))(x)
+    x = layers.Dense(512, activation="relu")(x)
+    out = layers.Dense(out_dim, activation="linear")(x)
+
+    model = Model(inp, out)
+    model.compile(optimizer="adam", loss="mse", metrics=["mae"])
+    return model
+
+
+def train():
+    stock_data, news_data, target_data = get_training_inputs()
+
+    cutoff_date = get_cutoff_date()
+
+    train_mask, val_mask = get_training_and_validation_mask(
+        stock_data.index, cutoff_date
+    )
+
+    X_stock_train = stock_data.loc[train_mask].values
+    X_stock_val = stock_data.loc[val_mask].values
+
+    pca = PCA(n_components=PCA_DIMS)
+    Xp_train = pca.fit_transform(X_stock_train)
+    Xp_val = pca.transform(X_stock_val)
+
+    X_news_train = news_data.loc[train_mask].values
+    X_news_val = news_data.loc[val_mask].values
+
+    X_train = np.hstack([Xp_train, X_news_train])
+    X_val = np.hstack([Xp_val, X_news_val])
+
+    Y_train = target_data.loc[train_mask].values
+    Y_val = target_data.loc[val_mask].values
+
+    Xtr_w, Ytr_w = make_windows(X_train, Y_train)
+    Xv_w, Yv_w = make_windows(X_val, Y_val)
+
+    model = build_model(Xtr_w.shape[2], Ytr_w.shape[1])
+
+    model_path = MODEL_PATH_TEMPLATE.format(cutoff=cutoff_date)
+    model.fit(
+        Xtr_w,
+        Ytr_w,
+        validation_data=(Xv_w, Yv_w),
+        epochs=EPOCHS,
+        batch_size=BATCH,
+        callbacks=[
+            ModelCheckpoint(model_path, save_best_only=True, monitor="val_loss"),
+            EarlyStopping(patience=6, restore_best_weights=True, monitor="val_loss"),
+            ReduceLROnPlateau(patience=3, factor=0.5, monitor="val_loss"),
+        ],
+    )
+
+    meta = {
+        "cutoff": str(cutoff_date),
+        "train_range": [
+            str(stock_data.index[train_mask].min()),
+            str(stock_data.index[train_mask].max()),
+        ],
+        "val_range": [
+            str(stock_data.index[val_mask].min()),
+            str(stock_data.index[val_mask].max()),
+        ],
+        "pca_dims": PCA_DIMS,
+        "window": WINDOW,
+    }
+    jl.dump(meta, METADATA_TEMPLATE.format(cutoff=cutoff_date))
+    jl.dump(pca, PCA_PATH_TEMPLATE.format(cutoff=cutoff_date))
+
+
+if __name__ == "__main__":
+    train()
