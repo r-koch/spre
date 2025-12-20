@@ -1,7 +1,9 @@
 # ---------- STANDARD LIBRARY ----------
+import json
 import os
-from typing import Iterable
-from datetime import date, timedelta
+import shutil
+from datetime import date
+from io import BytesIO
 
 # ---------- THIRD-PARTY LIBRARIES ----------
 import joblib as jl
@@ -13,7 +15,7 @@ import shared as s
 import stock_preproc as sp
 from sklearn.decomposition import PCA
 from tensorflow.keras import layers, Model, Input  # type: ignore
-from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau  # type: ignore
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau  # type: ignore
 
 # ---------- CONFIG ----------
 BUCKET = os.getenv("BUCKET", "dev-rkoch-spre")
@@ -30,12 +32,29 @@ PARTIAL_FILE_LIMIT = int(os.getenv("PARTIAL_FILE_LIMIT", "10"))
 if PARTIAL_FILE_LIMIT < 1:
     raise ValueError("PARTIAL_FILE_LIMIT must be >= 1")
 
-PCA_PATH_TEMPLATE = "artifacts/pca_{cutoff}.pkl"
-MODEL_PATH_TEMPLATE = "artifacts/model_{cutoff}.h5"
-METADATA_TEMPLATE = "artifacts/meta_{cutoff}.json"
+MODEL_PREFIX = "model/localDate="
+MODEL_LOCAL_PREFIX = "/tmp/model/"
+
+PCA_FILE_NAME = "/pca.pkl"
+METADATA_FILE_NAME = "/meta.json"
 
 
 # ---------- HELPERS ----------
+def write_directory_to_s3(local_dir: str, bucket: str, prefix: str):
+    for root, _, files in os.walk(local_dir):
+        for fname in files:
+            local_path = os.path.join(root, fname)
+            rel_path = os.path.relpath(local_path, local_dir)
+            key = f"{prefix}/{rel_path}"
+
+            with open(local_path, "rb") as reader:
+                s.retry_s3(
+                    lambda body=reader.read(): s.s3.put_object(
+                        Bucket=bucket, Key=key, Body=body
+                    )
+                )
+
+
 def deduplicate(table):
     seen = set()
     keep_indices: list[int] = []
@@ -186,7 +205,6 @@ def train():
 
     model = build_model(Xtr_w.shape[2], Ytr_w.shape[1])
 
-    model_path = MODEL_PATH_TEMPLATE.format(cutoff=cutoff_date)
     model.fit(
         Xtr_w,
         Ytr_w,
@@ -194,14 +212,30 @@ def train():
         epochs=EPOCHS,
         batch_size=BATCH,
         callbacks=[
-            ModelCheckpoint(model_path, save_best_only=True, monitor="val_loss"),
             EarlyStopping(patience=6, restore_best_weights=True, monitor="val_loss"),
             ReduceLROnPlateau(patience=3, factor=0.5, monitor="val_loss"),
         ],
     )
 
+    date_str = cutoff_date.isoformat()
+    base_prefix = f"{MODEL_PREFIX}{date_str}"
+
+    local_model_dir = f"{MODEL_LOCAL_PREFIX}{date_str}"
+    model.save(local_model_dir)
+
+    model_prefix = f"{base_prefix}/model"
+    write_directory_to_s3(local_model_dir, BUCKET, model_prefix)
+    shutil.rmtree(local_model_dir)
+
+    buffer = BytesIO()
+    jl.dump(pca, buffer)
+    buffer.seek(0)
+
+    pca_key = f"{base_prefix}{PCA_FILE_NAME}"
+    s.write_bytes_s3(BUCKET, pca_key, buffer.getvalue())
+
     meta = {
-        "cutoff": str(cutoff_date),
+        "cutoff": date_str,
         "train_range": [
             str(stock_data.index[train_mask].min()),
             str(stock_data.index[train_mask].max()),
@@ -210,12 +244,20 @@ def train():
             str(stock_data.index[val_mask].min()),
             str(stock_data.index[val_mask].max()),
         ],
-        "pca_dims": PCA_DIMS,
         "window": WINDOW,
+        "pca_dims": PCA_DIMS,
+        "lag_days": LAG_DAYS,
+        "features": {
+            "price_features": stock_data.shape[1],
+            "news_features": news_data.shape[1],
+        },
     }
-    jl.dump(meta, METADATA_TEMPLATE.format(cutoff=cutoff_date))
-    jl.dump(pca, PCA_PATH_TEMPLATE.format(cutoff=cutoff_date))
+    meta_bytes = json.dumps(meta, indent=2).encode("utf-8")
+
+    meta_key = f"{base_prefix}{METADATA_FILE_NAME}"
+    s.write_bytes_s3(BUCKET, meta_key, meta_bytes)
 
 
+# ---------- ENTRY POINT ----------
 if __name__ == "__main__":
     train()
