@@ -1,6 +1,6 @@
 # ---------- STANDARD LIBRARY ----------
 import os
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, timedelta
 
 # ---------- THIRD-PARTY LIBRARIES ----------
 import shared as s
@@ -42,9 +42,6 @@ META_DATA = "metadata/"
 COLLECTOR_STATE_KEY = f"{META_DATA}stock_collector_state.json"
 PREPROC_STATE_KEY = f"{META_DATA}stock_preproc_state.json"
 SYMBOLS_KEY = "symbols/spx.parquet"
-
-LAST_ADDED_KEY = "lastAdded"
-LAST_PROCESSED_KEY = "lastProcessed"
 
 RAW_PREFIX = "raw/stock/localDate="
 PIVOTED_PREFIX = "stock/pivoted/"
@@ -297,14 +294,14 @@ def append_target_row(
 def generate_pivoted_features(context=None):
     try:
         last_added_date = s.read_json_date_s3(
-            BUCKET, COLLECTOR_STATE_KEY, LAST_ADDED_KEY
+            BUCKET, COLLECTOR_STATE_KEY, s.LAST_ADDED_KEY
         )
         if last_added_date is None:
             return {"statusCode": 200, "body": "no raw data to process"}
 
         default_last_processed_date = START_DATE - ONE_DAY
         last_processed_date = s.read_json_date_s3(
-            BUCKET, PREPROC_STATE_KEY, LAST_PROCESSED_KEY, default_last_processed_date
+            BUCKET, PREPROC_STATE_KEY, s.LAST_PROCESSED_KEY, default_last_processed_date
         )
         if last_processed_date >= last_added_date:
             return {"statusCode": 200, "body": "all data already processed"}
@@ -359,7 +356,7 @@ def generate_pivoted_features(context=None):
         ]
         target_table = pa.Table.from_arrays(target_arrays, schema=target_schema)
 
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+        timestamp = s.get_now_timestamp()
 
         pivoted_key = f"{PIVOTED_PREFIX}{timestamp}.parquet"
         target_key = f"{TARGET_LOG_RETURNS_PREFIX}{timestamp}.parquet"
@@ -369,7 +366,7 @@ def generate_pivoted_features(context=None):
 
         new_last_processed = pivoted_table["localDate"].to_pylist()[-1]
         s.write_json_date_s3(
-            BUCKET, PREPROC_STATE_KEY, LAST_PROCESSED_KEY, new_last_processed
+            BUCKET, PREPROC_STATE_KEY, s.LAST_PROCESSED_KEY, new_last_processed
         )
 
         return {

@@ -4,7 +4,7 @@ import logging
 import os
 import random
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from io import BytesIO
 from typing import cast, overload
 
@@ -13,20 +13,23 @@ import boto3
 from botocore.exceptions import ClientError
 
 # ---------- THIRD-PARTY LIBRARIES LAZY ----------
-_pq = None
+_pyarrow_parquet = None
 
 
 def pyarrow_parquet():
-    global _pq
-    if _pq is None:
+    global _pyarrow_parquet
+    if _pyarrow_parquet is None:
         import pyarrow.parquet as pq
 
-        _pq = pq
-    return _pq
+        _pyarrow_parquet = pq
+    return _pyarrow_parquet
 
 
 # ---------- CONFIG ----------
 DEFAULT_MIN_REMAINING_MS = 60_000
+
+LAST_ADDED_KEY = "lastAdded"
+LAST_PROCESSED_KEY = "lastProcessed"
 
 AWS_REGION = os.getenv("AWS_REGION", "eu-west-1")
 RETRY_COUNT = int(os.getenv("RETRY_COUNT", "3"))
@@ -204,3 +207,7 @@ def list_keys_s3(bucket: str, prefix: str, sort_reversed: bool = False) -> list:
         return sorted(keys, reverse=sort_reversed)
 
     return cast(list, retry_s3(op))
+
+
+def get_now_timestamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")

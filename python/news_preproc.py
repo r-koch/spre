@@ -68,9 +68,6 @@ META_DATA = "metadata/"
 COLLECTOR_STATE_KEY = f"{META_DATA}news_collector_state.json"
 PREPROC_STATE_KEY = f"{META_DATA}news_preproc_state.json"
 
-LAST_ADDED_KEY = "lastAdded"
-LAST_PROCESSED_KEY = "lastProcessed"
-
 TEMP_PREFIX = "tmp/"
 RAW_PREFIX = "raw/news/localDate="
 SENTIMENT_PREFIX = "news/sentiment/localDate="
@@ -622,14 +619,14 @@ def append_lagged_row(
 def generate_lagged_features(context=None):
     try:
         last_added_date = s.read_json_date_s3(
-            BUCKET, COLLECTOR_STATE_KEY, LAST_ADDED_KEY
+            BUCKET, COLLECTOR_STATE_KEY, s.LAST_ADDED_KEY
         )
         if last_added_date is None:
             return {"statusCode": 200, "body": "no raw data to process"}
 
         default_last_processed_date = START_DATE - ONE_DAY
         last_processed_date = s.read_json_date_s3(
-            BUCKET, PREPROC_STATE_KEY, LAST_PROCESSED_KEY, default_last_processed_date
+            BUCKET, PREPROC_STATE_KEY, s.LAST_PROCESSED_KEY, default_last_processed_date
         )
         if last_processed_date > last_added_date:
             return {"statusCode": 200, "body": "all data already processed"}
@@ -686,14 +683,14 @@ def generate_lagged_features(context=None):
         ]
         lagged_table = pa.Table.from_arrays(arrays, schema=lagged_schema)
 
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-        file_name = f"{timestamp}.parquet"
-        lagged_key = f"{LAGGED_PREFIX}{file_name}"
+        timestamp = s.get_now_timestamp()
+        lagged_key = f"{LAGGED_PREFIX}{timestamp}.parquet"
+
         s.write_parquet_s3(lagged_table, BUCKET, lagged_key, lagged_schema)
 
         new_last_processed = lagged_table["localDate"].to_pylist()[-1]
         s.write_json_date_s3(
-            BUCKET, PREPROC_STATE_KEY, LAST_PROCESSED_KEY, new_last_processed
+            BUCKET, PREPROC_STATE_KEY, s.LAST_PROCESSED_KEY, new_last_processed
         )
 
         return {
