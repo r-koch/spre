@@ -1,15 +1,17 @@
-# ---------- STANDARD LIBRARY ----------
+# --- STANDARD ---
 import os
 import unicodedata
 from collections import deque
 from datetime import date, timedelta
 
-# ---------- THIRD-PARTY LIBRARIES ----------
-import regex as re
+# --- PROJECT ---
 import shared as s
+
+# --- THIRD-PARTY ---
+import regex as re
 from botocore.exceptions import ClientError
 
-# ---------- THIRD-PARTY LIBRARIES LAZY ----------
+# --- THIRD-PARTY LAZY ---
 _numpy = None
 _pyarrow = None
 _torch = None
@@ -42,19 +44,7 @@ def torch():
     return _torch
 
 
-# ---------- CONFIG ----------
-BUCKET = os.getenv("BUCKET", "dev-rkoch-spre")
-REGION = os.getenv("AWS_REGION", "eu-west-1")
-LAG_DAYS = int(os.getenv("LAG_DAYS", "5"))
-START_DATE = date.fromisoformat(os.getenv("START_DATE", "1999-11-01"))
-MIN_REMAINING_MS = int(os.getenv("MIN_REMAINING_MS", "240000"))
-MODEL_DIR_OR_NAME = os.getenv(
-    "MODEL_DIR", "ProsusAI/finbert"
-)  # locally use model name, in docker use env
-RETRY_COUNT = int(os.getenv("RETRY_COUNT", "3"))
-RETRY_DELAY_S = float(os.getenv("RETRY_DELAY_S", "0.25"))
-RETRY_MAX_DELAY_S = float(os.getenv("RETRY_MAX_DELAY_S", "2.0"))
-
+# --- CONFIG ---
 CONFLICT_THRESHOLD_LOW = 0.05
 CONFLICT_THRESHOLD_HIGH = 0.15
 EXTREME_THRESHOLD = 0.5
@@ -62,11 +52,16 @@ NEUTRAL_THRESHOLD = 0.1
 PREVENT_DIV_BY_ZERO = 1e-9
 TOKENIZER_MAX_LENGTH = 512
 
-TEMP_PREFIX = "tmp/"
 RAW_PREFIX = "raw/news/localDate="
 SENTIMENT_PREFIX = "news/sentiment/localDate="
 AGGREGATED_PREFIX = "news/aggregated/localDate="
-LAGGED_PREFIX = f"news/lagged-{LAG_DAYS}/"
+
+MIN_REMAINING_MS = int(os.getenv("MIN_REMAINING_MS", "240000"))
+MODEL_DIR_OR_NAME = os.getenv(
+    "MODEL_DIR", "ProsusAI/finbert"
+)  # locally use model name, in docker use env
+
+LAG_DAYS = s.LAG_DAYS
 
 LOGGER = s.setup_logger(__file__)
 
@@ -108,7 +103,7 @@ def get_batch_size() -> int:
 BATCH_SIZE = get_batch_size()
 
 
-# ---------- SCHEMAS ----------
+# --- SCHEMAS ---
 _raw_schema = None
 
 
@@ -148,73 +143,13 @@ def get_sentiment_schema():
     return _sentiment_schema
 
 
-_aggregated_schema = None
-
-
-def get_aggregated_schema():
-    global _aggregated_schema
-    if _aggregated_schema is None:
-        pa = pyarrow()
-        _aggregated_schema = pa.schema(
-            {
-                "localDate": pa.date32(),
-                "count_articles": pa.int32(),
-                "mean_sentiment": pa.float32(),
-                "median_sentiment": pa.float32(),
-                "pct_positive": pa.float32(),
-                "pct_negative": pa.float32(),
-                "polarity_ratio": pa.float32(),
-                "weighted_mean_sentiment": pa.float32(),
-                "extreme_sentiment_share": pa.float32(),
-                "sentiment_skewness": pa.float32(),
-                "sentiment_kurtosis": pa.float32(),
-                "neutral_share": pa.float32(),
-                "max_sentiment": pa.float32(),
-                "min_sentiment": pa.float32(),
-                "article_length_variance": pa.float32(),
-                "ratio_pos_neg": pa.float32(),
-                "conflict_share": pa.float32(),
-            }
-        )
-    return _aggregated_schema
-
-
-_aggregated_columns = None
-
-
-def get_aggregated_columns() -> list[str]:
-    global _aggregated_columns
-    if _aggregated_columns is None:
-        _aggregated_columns = [
-            name for name in get_aggregated_schema().names if name != "localDate"
-        ]
-    return _aggregated_columns
-
-
-_lagged_schema = None
-
-
-def get_lagged_schema():
-    global _lagged_schema
-    if _lagged_schema is None:
-        pa = pyarrow()
-        fields = [pa.field("localDate", pa.date32())]
-        aggregated_columns = get_aggregated_columns()
-        for lag in range(1, LAG_DAYS + 1):
-            for col in aggregated_columns:
-                fields.append(pa.field(f"{col}-{lag}", pa.float32()))
-
-        _lagged_schema = pa.schema(fields)
-    return _lagged_schema
-
-
 _lagged_column_names = None
 
 
 def get_lagged_column_names():
     global _lagged_column_names
     if _lagged_column_names is None:
-        aggregated_columns = get_aggregated_columns()
+        aggregated_columns = s.get_aggregated_columns()
         _lagged_column_names = [
             [f"{col}-{lag}" for col in aggregated_columns]
             for lag in range(LAG_DAYS, 0, -1)
@@ -230,12 +165,12 @@ def get_empty_aggregated():
     if _empty_aggregated is None:
         _empty_aggregated = {
             col: 0 if col == "count_articles" else 0.0
-            for col in get_aggregated_columns()
+            for col in s.get_aggregated_columns()
         }
     return _empty_aggregated.copy()
 
 
-# ---------- MODEL (Lazy Loaded) ----------
+# --- MODEL (Lazy Loaded) ---
 LOCAL_FILES_ONLY = "MODEL_DIR" in os.environ
 
 _device = None
@@ -355,19 +290,21 @@ def fast_kurtosis(x):
 
 def get_sentiment(py_date: date):
     date_str = py_date.isoformat()
-    raw_key = f"{RAW_PREFIX}{date_str}/data.parquet"
-    sentiment_key = f"{SENTIMENT_PREFIX}{date_str}/data.parquet"
 
+    sentiment_key = f"{SENTIMENT_PREFIX}{date_str}/data.parquet"
     sentiment_schema = get_sentiment_schema()
 
     try:
-        return s.read_parquet_s3(BUCKET, sentiment_key, sentiment_schema)
+        return s.read_parquet_s3(sentiment_key, sentiment_schema)
     except ClientError as e:
         if e.response.get("Error", {}).get("Code", "") != "NoSuchKey":
             raise
 
+    raw_key = f"{RAW_PREFIX}{date_str}/data.parquet"
+    raw_schema = get_raw_schema()
+
     try:
-        raw_table = s.read_parquet_s3(BUCKET, raw_key, get_raw_schema())
+        raw_table = s.read_parquet_s3(raw_key, raw_schema)
     except ClientError as e:
         if e.response.get("Error", {}).get("Code", "") == "NoSuchKey":
             return None
@@ -464,18 +401,18 @@ def get_sentiment(py_date: date):
         names=sentiment_schema.names,
     )
 
-    s.write_parquet_s3(BUCKET, sentiment_key, sentiment_table, sentiment_schema)
+    s.write_parquet_s3(sentiment_key, sentiment_table, sentiment_schema)
     return sentiment_table
 
 
 def get_aggregated(py_date: date) -> dict[str, float]:
     aggregated_key = f"{AGGREGATED_PREFIX}{py_date.isoformat()}/data.parquet"
 
-    aggregated_schema = get_aggregated_schema()
-    aggregated_columns = get_aggregated_columns()
+    aggregated_schema = s.get_aggregated_schema()
+    aggregated_columns = s.get_aggregated_columns()
 
     try:
-        aggregated_table = s.read_parquet_s3(BUCKET, aggregated_key, aggregated_schema)
+        aggregated_table = s.read_parquet_s3(aggregated_key, aggregated_schema)
         assert aggregated_table is not None
         return {
             column_name: aggregated_table[column_name][0].as_py()
@@ -567,9 +504,7 @@ def get_aggregated(py_date: date) -> dict[str, float]:
                 schema=aggregated_schema,
             )
 
-            s.write_parquet_s3(
-                BUCKET, aggregated_key, aggregated_table, aggregated_schema
-            )
+            s.write_parquet_s3(aggregated_key, aggregated_table, aggregated_schema)
 
             aggregated_values = [
                 count_articles,
@@ -610,14 +545,13 @@ def append_lagged_row(
 def generate_lagged_features(context=None):
     try:
         last_added_date = s.read_json_date_s3(
-            BUCKET, s.NEWS_COLLECTOR_STATE_KEY, s.LAST_ADDED_KEY
+            s.NEWS_COLLECTOR_STATE_KEY, s.LAST_ADDED_KEY
         )
         if last_added_date is None:
             return s.result(LOGGER, 200, "no raw data to process")
 
-        default_last_processed_date = START_DATE - s.ONE_DAY
+        default_last_processed_date = s.START_DATE - s.ONE_DAY
         last_processed_date = s.read_json_date_s3(
-            BUCKET,
             s.NEWS_PREPROC_STATE_KEY,
             s.LAST_PROCESSED_KEY,
             default_last_processed_date,
@@ -635,10 +569,10 @@ def generate_lagged_features(context=None):
             aggregated_dict = get_aggregated(lag_date)
             rolling_window.append(aggregated_dict)
 
-        lagged_schema = get_lagged_schema()
+        lagged_schema = s.get_lagged_schema()
         lagged_columns = {field.name: [] for field in lagged_schema}
 
-        aggregated_columns = get_aggregated_columns()
+        aggregated_columns = s.get_aggregated_columns()
         lagged_column_names = get_lagged_column_names()
 
         days_processed = 0
@@ -675,13 +609,13 @@ def generate_lagged_features(context=None):
         lagged_table = pa.Table.from_arrays(arrays, schema=lagged_schema)
 
         timestamp = s.get_now_timestamp()
-        lagged_key = f"{LAGGED_PREFIX}{timestamp}.parquet"
+        lagged_key = f"{s.LAGGED_PREFIX}{timestamp}.parquet"
 
-        s.write_parquet_s3(BUCKET, lagged_key, lagged_table, lagged_schema)
+        s.write_parquet_s3(lagged_key, lagged_table, lagged_schema)
 
         new_last_processed = lagged_table["localDate"].to_pylist()[-1]
         s.write_json_date_s3(
-            BUCKET, s.NEWS_PREPROC_STATE_KEY, s.LAST_PROCESSED_KEY, new_last_processed
+            s.NEWS_PREPROC_STATE_KEY, s.LAST_PROCESSED_KEY, new_last_processed
         )
 
         return s.result(LOGGER, 200, "finished preprocessing")
@@ -695,6 +629,6 @@ def lambda_handler(event=None, context=None):
     return generate_lagged_features(context)
 
 
-# ---------- ENTRY POINT ----------
+# --- ENTRY POINT ---
 if __name__ == "__main__":
     generate_lagged_features()

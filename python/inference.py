@@ -1,47 +1,25 @@
-# ---------- STANDARD LIBRARY ----------
+# --- STANDARD ---
 import json
 import os
 import pickle
 import tempfile
 from datetime import date
 
-# ---------- THIRD-PARTY ----------
+# --- PROJECT ---
+import shared as s
+
+# --- THIRD-PARTY ---
 import numpy as np
 import pyarrow as pa
 from tensorflow.keras import models  # type: ignore
 
-# ---------- PROJECT ----------
-import shared as s
-import stock_preproc as sp
-import news_preproc as npg
 
-# ---------- CONFIG ----------
-BUCKET = os.getenv("BUCKET", "dev-rkoch-spre")
-
-INFERENCE_PREFIX = "inference/localDate="
-
-DTYPE = np.float32
-
-
-_inference_schema = None
-
-
-def get_inference_schema():
-    global _inference_schema
-    if _inference_schema is None:
-        # pa = pyarrow()
-        _inference_schema = pa.schema(
-            {
-                "localDate": pa.date32(),
-                "symbol": pa.string(),
-                "predicted_log_return": pa.float32(),
-            }
-        )
-    return _inference_schema
+# --- CONFIG ---
+FLOAT_32 = np.float32
 
 
 def get_model_prefix() -> str:
-    model_date = s.read_json_date_s3(BUCKET, s.TRAINING_STATE_KEY, s.LAST_TRAINED_KEY)
+    model_date = s.read_json_date_s3(s.TRAINING_STATE_KEY, s.LAST_TRAINED_KEY)
     return f"{s.MODEL_PREFIX}{model_date}/"
 
 
@@ -51,7 +29,7 @@ def load_model_artifacts(model_prefix: str):
     meta_key = f"{model_prefix}{s.META_FILE_NAME}"
 
     with tempfile.TemporaryDirectory() as tmp:
-        model_data = s.read_bytes_s3(BUCKET, model_key)
+        model_data = s.read_bytes_s3(model_key)
 
         local_model_path = os.path.join(tmp, s.MODEL_FILE_NAME)
         with open(local_model_path, "wb") as f:
@@ -59,23 +37,21 @@ def load_model_artifacts(model_prefix: str):
 
         model = models.load_model(local_model_path, compile=False)
 
-    pca_data = s.read_bytes_s3(BUCKET, pca_key)
+    pca_data = s.read_bytes_s3(pca_key)
     pca = pickle.loads(pca_data)
 
-    meta_data = s.read_bytes_s3(BUCKET, meta_key)
+    meta_data = s.read_bytes_s3(meta_key)
     meta = json.loads(meta_data.decode("utf-8"))
 
     return model, pca, meta
 
 
-def load_window(
-    bucket: str, prefix: str, schema, end_date: date, window_size: int
-) -> np.ndarray:
-    keys = s.list_keys_s3(bucket, prefix, sort_reversed=True)
+def load_window(prefix: str, schema, end_date: date, window_size: int) -> np.ndarray:
+    keys = s.list_keys_s3(prefix, sort_reversed=True)
     local_date = "localDate"
     rows = []
     for key in keys:
-        table = s.read_parquet_s3(bucket, key, schema)
+        table = s.read_parquet_s3(key, schema)
         dates = table[local_date].to_pylist()
 
         for i in range(len(dates) - 1, -1, -1):
@@ -94,7 +70,7 @@ def load_window(
         raise ValueError("Insufficient data for inference window")
 
     rows.reverse()
-    return np.asarray(rows, dtype=DTYPE)
+    return np.asarray(rows, dtype=FLOAT_32)
 
 
 def build_model_input(
@@ -108,7 +84,7 @@ def build_model_input(
 
 
 def infer():
-    last_processed_date = s.get_last_processed_date(BUCKET)
+    last_processed_date = s.get_last_processed_date()
     inference_date = last_processed_date + s.ONE_DAY
 
     model_prefix = get_model_prefix()
@@ -117,27 +93,25 @@ def infer():
     window_size = meta["windowSize"]
 
     stock_window = load_window(
-        BUCKET,
-        sp.PIVOTED_PREFIX,
-        sp.get_pivoted_schema(),
+        s.PIVOTED_PREFIX,
+        s.get_pivoted_schema(),
         last_processed_date,
         window_size,
     )
     news_window = load_window(
-        BUCKET,
-        npg.LAGGED_PREFIX,
-        npg.get_lagged_schema(),
+        s.LAGGED_PREFIX,
+        s.get_lagged_schema(),
         last_processed_date,
         window_size,
     )
 
     x = build_model_input(stock_window, news_window, pca)
 
-    preds = model.predict(x, verbose=0)[0].astype(DTYPE)
+    preds = model.predict(x, verbose=0)[0].astype(FLOAT_32)
 
-    symbols = sp.get_symbols()
+    symbols = s.get_symbols()
 
-    inference_schema = get_inference_schema()
+    inference_schema = s.get_inference_schema()
 
     inference_table = pa.Table.from_arrays(
         [
@@ -147,19 +121,19 @@ def infer():
         ],
         schema=inference_schema,
     )
-    inference_key = f"{INFERENCE_PREFIX}{inference_date.isoformat()}/data.parquet"
-    s.write_parquet_s3(BUCKET, inference_key, inference_table, inference_schema)
+    inference_key = f"{s.INFERENCE_PREFIX}{inference_date.isoformat()}/data.parquet"
+    s.write_parquet_s3(inference_key, inference_table, inference_schema)
 
     inference_meta = {
         "modelPrefix": model_prefix,
         "inferenceDate": inference_date.isoformat(),
         "trainingCutoff": meta["trainingCutoff"],
     }
-    inference_meta_key = f"{INFERENCE_PREFIX}{inference_date.isoformat()}/meta.json"
+    inference_meta_key = f"{s.INFERENCE_PREFIX}{inference_date.isoformat()}/meta.json"
     inference_meta_data = json.dumps(inference_meta, indent=2).encode("utf-8")
-    s.write_bytes_s3(BUCKET, inference_meta_key, inference_meta_data)
+    s.write_bytes_s3(inference_meta_key, inference_meta_data)
 
 
-# ---------- ENTRY POINT ----------
+# --- ENTRY POINT ---
 if __name__ == "__main__":
     infer()

@@ -1,12 +1,14 @@
-# ---------- STANDARD LIBRARY ----------
+# --- STANDARD ---
 import os
 from datetime import date
 
-# ---------- THIRD-PARTY LIBRARIES ----------
+# --- PROJECT ---
 import shared as s
+
+# --- THIRD-PARTY ---
 from botocore.exceptions import ClientError
 
-# ---------- THIRD-PARTY LIBRARIES LAZY ----------
+# --- THIRD-PARTY LAZY ---
 _numpy = None
 _pyarrow = None
 
@@ -29,23 +31,16 @@ def pyarrow():
     return _pyarrow
 
 
-# ---------- CONFIG ----------
-BUCKET = os.getenv("BUCKET", "dev-rkoch-spre")
-START_DATE = date.fromisoformat(os.getenv("START_DATE", "1999-11-01"))
-MIN_REMAINING_MS = int(os.getenv("MIN_REMAINING_MS", "10000"))
-
-
+# --- CONFIG ---
 MIN_PRICE = 1e-3
 
-SYMBOLS_KEY = "symbols/spx.parquet"
-
 RAW_PREFIX = "raw/stock/localDate="
-PIVOTED_PREFIX = "stock/pivoted/"
-TARGET_LOG_RETURNS_PREFIX = "stock/target-log-returns/"
+
+MIN_REMAINING_MS = int(os.getenv("MIN_REMAINING_MS", "10000"))
 
 LOGGER = s.setup_logger(__file__)
 
-# ---------- SCHEMAS ----------
+# --- SCHEMAS ---
 _raw_schema = None
 
 
@@ -67,41 +62,13 @@ def get_raw_schema():
     return _raw_schema
 
 
-_symbols_schema = None
-
-
-def get_symbols_schema():
-    global _symbols_schema
-    if _symbols_schema is None:
-        pa = pyarrow()
-        _symbols_schema = pa.schema(
-            {
-                "id": pa.string(),
-                "sector": pa.string(),
-            }
-        )
-    return _symbols_schema
-
-
-_symbols = None
-
-
-def get_symbols():
-    global _symbols
-    if _symbols is None:
-        symbols_table = s.read_parquet_s3(BUCKET, SYMBOLS_KEY, get_symbols_schema())
-        assert symbols_table is not None
-        _symbols = symbols_table.column("id").to_pylist()
-    return _symbols
-
-
 _close_column = None
 
 
 def get_close_column():
     global _close_column
     if _close_column is None:
-        _close_column = [f"{symbol}_close" for symbol in get_symbols()]
+        _close_column = [f"{symbol}_close" for symbol in s.get_symbols()]
     return _close_column
 
 
@@ -111,7 +78,7 @@ _high_column = None
 def get_high_column():
     global _high_column
     if _high_column is None:
-        _high_column = [f"{symbol}_high" for symbol in get_symbols()]
+        _high_column = [f"{symbol}_high" for symbol in s.get_symbols()]
     return _high_column
 
 
@@ -121,7 +88,7 @@ _low_column = None
 def get_low_column():
     global _low_column
     if _low_column is None:
-        _low_column = [f"{symbol}_low" for symbol in get_symbols()]
+        _low_column = [f"{symbol}_low" for symbol in s.get_symbols()]
     return _low_column
 
 
@@ -131,7 +98,7 @@ _open_column = None
 def get_open_column():
     global _open_column
     if _open_column is None:
-        _open_column = [f"{symbol}_open" for symbol in get_symbols()]
+        _open_column = [f"{symbol}_open" for symbol in s.get_symbols()]
     return _open_column
 
 
@@ -141,51 +108,15 @@ _volume_column = None
 def get_volume_column():
     global _volume_column
     if _volume_column is None:
-        _volume_column = [f"{symbol}_volume" for symbol in get_symbols()]
+        _volume_column = [f"{symbol}_volume" for symbol in s.get_symbols()]
     return _volume_column
-
-
-_pivoted_schema = None
-
-
-def get_pivoted_schema():
-    global _pivoted_schema
-    if _pivoted_schema is None:
-        pa = pyarrow()
-        fields = [pa.field("localDate", pa.date32())]
-        for sym in get_symbols():
-            fields.extend(
-                [
-                    pa.field(f"{sym}_close", pa.float32()),
-                    pa.field(f"{sym}_high", pa.float32()),
-                    pa.field(f"{sym}_low", pa.float32()),
-                    pa.field(f"{sym}_open", pa.float32()),
-                    pa.field(f"{sym}_volume", pa.float32()),
-                ]
-            )
-        _pivoted_schema = pa.schema(fields)
-    return _pivoted_schema
-
-
-_target_schema = None
-
-
-def get_target_schema():
-    global _target_schema
-    if _target_schema is None:
-        pa = pyarrow()
-        fields = [pa.field("localDate", pa.date32())]
-        for sym in get_symbols():
-            fields.append(pa.field(f"{sym}_return", pa.float32()))
-        _target_schema = pa.schema(fields)
-    return _target_schema
 
 
 def append_pivoted_row(pivoted_columns: dict, py_date: date):
     raw_key = f"{RAW_PREFIX}{py_date.isoformat()}/data.parquet"
 
     try:
-        raw_table = s.read_parquet_s3(BUCKET, raw_key, get_raw_schema())
+        raw_table = s.read_parquet_s3(raw_key, get_raw_schema())
     except ClientError as e:
         if e.response.get("Error", {}).get("Code", "") == "NoSuchKey":
             return None
@@ -199,7 +130,7 @@ def append_pivoted_row(pivoted_columns: dict, py_date: date):
     opens_ = raw_table["open"].to_numpy().astype("float32", copy=False)
     volumes = raw_table["volume"].to_numpy().astype("float32", copy=False)
 
-    symbols = get_symbols()
+    symbols = s.get_symbols()
     close_cols = get_close_column()
     high_cols = get_high_column()
     low_cols = get_low_column()
@@ -235,19 +166,18 @@ def compute_log_returns(prev_closes, curr_closes):
     return out
 
 
-def get_previous_closes(last_processed: date):
-    if last_processed < START_DATE:
+def get_previous_closes(last_processed: date, schema):
+    if last_processed < s.START_DATE:
         return None
 
-    keys = s.list_keys_s3(BUCKET, PIVOTED_PREFIX, sort_reversed=True)
+    keys = s.list_keys_s3(s.PIVOTED_PREFIX, sort_reversed=True)
     if not keys:
         raise ValueError(f"no pivoted data found for {last_processed}")
 
-    schema = get_pivoted_schema()
     np = numpy()
     close_cols = get_close_column()
 
-    pivoted_table = s.read_parquet_s3(BUCKET, keys[0], schema)
+    pivoted_table = s.read_parquet_s3(keys[0], schema)
     assert pivoted_table is not None
 
     if pivoted_table["localDate"][-1].as_py() == last_processed:
@@ -258,7 +188,7 @@ def get_previous_closes(last_processed: date):
 
     pa = pyarrow()
     for key in keys:
-        pivoted_table = s.read_parquet_s3(BUCKET, key, schema)
+        pivoted_table = s.read_parquet_s3(key, schema)
         assert pivoted_table is not None
 
         indices = (pivoted_table["localDate"] == pa.scalar(last_processed)).nonzero()[0]
@@ -278,25 +208,24 @@ def append_target_row(
     target_columns["localDate"].append(py_date)
 
     if previous_closes is None:
-        for sym in get_symbols():
+        for sym in s.get_symbols():
             target_columns[f"{sym}_return"].append(0.0)
     else:
         returns = compute_log_returns(previous_closes, curr_closes)
-        for sym, value in zip(get_symbols(), returns):
+        for sym, value in zip(s.get_symbols(), returns):
             target_columns[f"{sym}_return"].append(value)
 
 
 def generate_pivoted_features(context=None):
     try:
         last_added_date = s.read_json_date_s3(
-            BUCKET, s.STOCK_COLLECTOR_STATE_KEY, s.LAST_ADDED_KEY
+            s.STOCK_COLLECTOR_STATE_KEY, s.LAST_ADDED_KEY
         )
         if last_added_date is None:
             return s.result(LOGGER, 200, "no raw data to process")
 
-        default_last_processed_date = START_DATE - s.ONE_DAY
+        default_last_processed_date = s.START_DATE - s.ONE_DAY
         last_processed_date = s.read_json_date_s3(
-            BUCKET,
             s.STOCK_PREPROC_STATE_KEY,
             s.LAST_PROCESSED_KEY,
             default_last_processed_date,
@@ -306,13 +235,13 @@ def generate_pivoted_features(context=None):
 
         current_date = last_processed_date + s.ONE_DAY
 
-        pivoted_schema = get_pivoted_schema()
+        pivoted_schema = s.get_pivoted_schema()
         pivoted_columns = {field.name: [] for field in pivoted_schema}
 
-        target_schema = get_target_schema()
+        target_schema = s.get_target_schema()
         target_columns = {field.name: [] for field in target_schema}
 
-        previous_closes = get_previous_closes(last_processed_date)
+        previous_closes = get_previous_closes(last_processed_date, pivoted_schema)
 
         days_processed = 0
 
@@ -353,15 +282,15 @@ def generate_pivoted_features(context=None):
 
         timestamp = s.get_now_timestamp()
 
-        pivoted_key = f"{PIVOTED_PREFIX}{timestamp}.parquet"
-        target_key = f"{TARGET_LOG_RETURNS_PREFIX}{timestamp}.parquet"
+        pivoted_key = f"{s.PIVOTED_PREFIX}{timestamp}.parquet"
+        target_key = f"{s.TARGET_LOG_RETURNS_PREFIX}{timestamp}.parquet"
 
-        s.write_parquet_s3(BUCKET, pivoted_key, pivoted_table, pivoted_schema)
-        s.write_parquet_s3(BUCKET, target_key, target_table, target_schema)
+        s.write_parquet_s3(pivoted_key, pivoted_table, pivoted_schema)
+        s.write_parquet_s3(target_key, target_table, target_schema)
 
         new_last_processed = pivoted_table["localDate"].to_pylist()[-1]
         s.write_json_date_s3(
-            BUCKET, s.STOCK_PREPROC_STATE_KEY, s.LAST_PROCESSED_KEY, new_last_processed
+            s.STOCK_PREPROC_STATE_KEY, s.LAST_PROCESSED_KEY, new_last_processed
         )
 
         return s.result(LOGGER, 200, "finished preprocessing")
@@ -375,6 +304,6 @@ def lambda_handler(event=None, context=None):
     return generate_pivoted_features(context)
 
 
-# ---------- ENTRY POINT ----------
+# --- ENTRY POINT ---
 if __name__ == "__main__":
     generate_pivoted_features()

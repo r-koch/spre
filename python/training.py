@@ -1,4 +1,4 @@
-# ---------- STANDARD LIBRARY ----------
+# --- STANDARD ---
 import json
 import os
 import pickle
@@ -6,19 +6,18 @@ import tempfile
 from datetime import date
 from io import BytesIO
 
-# ---------- THIRD-PARTY LIBRARIES ----------
-import news_preproc as npg
+# --- PROJECT ---
+import shared as s
+
+# --- THIRD-PARTY ---
 import numpy as np
 import pandas as pd
 import pyarrow as pa
-import shared as s
-import stock_preproc as sp
 from sklearn.decomposition import PCA
 from tensorflow.keras import layers, Model, Input  # type: ignore
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau  # type: ignore
 
-# ---------- CONFIG ----------
-BUCKET = os.getenv("BUCKET", "dev-rkoch-spre")
+# --- CONFIG ---
 VAL_DAYS = int(os.getenv("VAL_DAYS", "30"))
 WINDOW = int(os.getenv("WINDOW", "20"))
 PCA_DIMS = int(os.getenv("PCA_DIMS", "64"))
@@ -30,12 +29,9 @@ PARTIAL_FILE_LIMIT = int(os.getenv("PARTIAL_FILE_LIMIT", "1"))
 if PARTIAL_FILE_LIMIT < 1:
     raise ValueError("PARTIAL_FILE_LIMIT must be > 0")
 
-MODEL_LOCAL_PREFIX = "/tmp/model/"
-
 LOGGER = s.setup_logger(__file__)
 
 
-# ---------- HELPERS ----------
 def deduplicate(table):
     seen = set()
     keep_indices: list[int] = []
@@ -54,8 +50,8 @@ def deduplicate(table):
 def get_all_keys_and_deduplicated_table(
     prefix: str, schema
 ) -> tuple[list[str], pa.Table]:
-    keys = s.list_keys_s3(BUCKET, prefix)
-    tables = [s.read_parquet_s3(BUCKET, key, schema) for key in keys]
+    keys = s.list_keys_s3(prefix)
+    tables = [s.read_parquet_s3(key, schema) for key in keys]
     combined = pa.concat_tables(tables, promote_options="none")
     deduplicated = deduplicate(combined)
     return keys, deduplicated
@@ -68,10 +64,10 @@ def consolidate(current_keys: list[str], table: pa.Table, prefix: str, schema):
     timestamp = s.get_now_timestamp()
     new_key = f"{prefix}{timestamp}.parquet"
 
-    s.write_parquet_s3(BUCKET, new_key, table, schema, CONSOLIDATED_COMPRESSION_LEVEL)
+    s.write_parquet_s3(new_key, table, schema, CONSOLIDATED_COMPRESSION_LEVEL)
 
     for key in current_keys:
-        s.retry_s3(lambda: s.s3.delete_object(Bucket=BUCKET, Key=key))
+        s.delete_s3(key)
 
 
 def get_data_frame(prefix: str, schema):
@@ -86,9 +82,9 @@ def get_data_frame(prefix: str, schema):
 
 
 def get_training_inputs():
-    stock_data = get_data_frame(sp.PIVOTED_PREFIX, sp.get_pivoted_schema())
-    news_data = get_data_frame(npg.LAGGED_PREFIX, npg.get_lagged_schema())
-    target_data = get_data_frame(sp.TARGET_LOG_RETURNS_PREFIX, sp.get_target_schema())
+    stock_data = get_data_frame(s.PIVOTED_PREFIX, s.get_pivoted_schema())
+    news_data = get_data_frame(s.LAGGED_PREFIX, s.get_lagged_schema())
+    target_data = get_data_frame(s.TARGET_LOG_RETURNS_PREFIX, s.get_target_schema())
 
     common_index = stock_data.index.intersection(news_data.index).intersection(
         target_data.index
@@ -108,10 +104,6 @@ def get_training_inputs():
         raise ValueError("Hard fail: misaligned indices")
 
     return stock_data, news_data, target_data
-
-
-def get_cutoff_date() -> date:
-    return s.get_last_processed_date(BUCKET)
 
 
 def get_training_and_validation_mask(index: pd.DatetimeIndex, cutoff_date: date):
@@ -156,7 +148,7 @@ def train():
     try:
         stock_data, news_data, target_data = get_training_inputs()
 
-        cutoff_date = get_cutoff_date()
+        cutoff_date = s.get_last_processed_date()
 
         train_mask, val_mask = get_training_and_validation_mask(
             stock_data.index, cutoff_date
@@ -208,14 +200,14 @@ def train():
                 model_data = f.read()
 
             model_key = f"{base_prefix}{s.MODEL_FILE_NAME}"
-            s.write_bytes_s3(BUCKET, model_key, model_data)
+            s.write_bytes_s3(model_key, model_data)
 
         buffer = BytesIO()
         pickle.dump(pca, buffer, protocol=pickle.HIGHEST_PROTOCOL)
         pca_data = buffer.getvalue()
 
         pca_key = f"{base_prefix}{s.PCA_FILE_NAME}"
-        s.write_bytes_s3(BUCKET, pca_key, pca_data)
+        s.write_bytes_s3(pca_key, pca_data)
 
         meta = {
             "trainingCutoff": model_date,
@@ -237,16 +229,14 @@ def train():
         meta_data = json.dumps(meta, indent=2).encode("utf-8")
 
         meta_key = f"{base_prefix}{s.META_FILE_NAME}"
-        s.write_bytes_s3(BUCKET, meta_key, meta_data)
+        s.write_bytes_s3(meta_key, meta_data)
 
-        s.write_json_date_s3(
-            BUCKET, s.TRAINING_STATE_KEY, s.LAST_TRAINED_KEY, cutoff_date
-        )
+        s.write_json_date_s3(s.TRAINING_STATE_KEY, s.LAST_TRAINED_KEY, cutoff_date)
 
     except Exception:
         LOGGER.exception("Error in train")
 
 
-# ---------- ENTRY POINT ----------
+# --- ENTRY POINT ---
 if __name__ == "__main__":
     train()
