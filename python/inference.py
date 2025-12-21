@@ -83,9 +83,14 @@ def build_model_input(
     return x.reshape(1, *x.shape)
 
 
-def infer():
+def infer(inference_date: date | None = None):
     last_processed_date = s.get_last_processed_date()
-    inference_date = last_processed_date + s.ONE_DAY
+    max_inference_date = last_processed_date + s.ONE_DAY
+
+    if inference_date is None or inference_date > max_inference_date:
+        inference_date = max_inference_date
+
+    end_date = inference_date - s.ONE_DAY
 
     model_prefix = get_model_prefix()
     model, pca, meta = load_model_artifacts(model_prefix)
@@ -95,13 +100,13 @@ def infer():
     stock_window = load_window(
         s.PIVOTED_PREFIX,
         s.get_pivoted_schema(),
-        last_processed_date,
+        end_date,
         window_size,
     )
     news_window = load_window(
         s.LAGGED_PREFIX,
         s.get_lagged_schema(),
-        last_processed_date,
+        end_date,
         window_size,
     )
 
