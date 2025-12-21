@@ -245,7 +245,6 @@ def train():
 
     except Exception:
         LOGGER.exception("Error in train")
-        return {"statusCode": 500, "body": "error"}
 
 
 # ---------- ENTRY POINT ----------
