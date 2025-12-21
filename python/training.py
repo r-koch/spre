@@ -18,16 +18,15 @@ from tensorflow.keras import layers, Model, Input  # type: ignore
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau  # type: ignore
 
 # --- CONFIG ---
-VAL_DAYS = int(os.getenv("VAL_DAYS", "30"))
-WINDOW = int(os.getenv("WINDOW", "20"))
-PCA_DIMS = int(os.getenv("PCA_DIMS", "64"))
 BATCH = int(os.getenv("BATCH_SIZE", "128"))
-EPOCHS = int(os.getenv("EPOCHS", "50"))
 CONSOLIDATED_COMPRESSION_LEVEL = int(os.getenv("CONSOLIDATED_COMPRESSION_LEVEL", "3"))
-
+EPOCHS = int(os.getenv("EPOCHS", "50"))
 PARTIAL_FILE_LIMIT = int(os.getenv("PARTIAL_FILE_LIMIT", "1"))
 if PARTIAL_FILE_LIMIT < 1:
     raise ValueError("PARTIAL_FILE_LIMIT must be > 0")
+PCA_DIMS = int(os.getenv("PCA_DIMS", "64"))
+VAL_DAYS = int(os.getenv("VAL_DAYS", "30"))
+WINDOW = int(os.getenv("WINDOW", "20"))
 
 LOGGER = s.setup_logger(__file__)
 
