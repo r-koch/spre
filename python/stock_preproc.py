@@ -34,8 +34,6 @@ BUCKET = os.getenv("BUCKET", "dev-rkoch-spre")
 START_DATE = date.fromisoformat(os.getenv("START_DATE", "1999-11-01"))
 MIN_REMAINING_MS = int(os.getenv("MIN_REMAINING_MS", "10000"))
 
-DEBUG_MAX_DATE = date.fromisoformat(os.getenv("DEBUG_MAX_DATE", "2000-11-01"))
-DEBUG_MAX_DAYS_PER_INVOCATION = int(os.getenv("DEBUG_MAX_DAYS_PER_INVOCATION", "-1"))
 
 MIN_PRICE = 1e-3
 
@@ -294,7 +292,7 @@ def generate_pivoted_features(context=None):
             BUCKET, s.STOCK_COLLECTOR_STATE_KEY, s.LAST_ADDED_KEY
         )
         if last_added_date is None:
-            return {"statusCode": 200, "body": "no raw data to process"}
+            return s.result(LOGGER, 200, "no raw data to process")
 
         default_last_processed_date = START_DATE - s.ONE_DAY
         last_processed_date = s.read_json_date_s3(
@@ -304,7 +302,7 @@ def generate_pivoted_features(context=None):
             default_last_processed_date,
         )
         if last_processed_date >= last_added_date:
-            return {"statusCode": 200, "body": "all data already processed"}
+            return s.result(LOGGER, 200, "all data already processed")
 
         current_date = last_processed_date + s.ONE_DAY
 
@@ -319,10 +317,7 @@ def generate_pivoted_features(context=None):
         days_processed = 0
 
         while s.continue_execution(context, MIN_REMAINING_MS, LOGGER):
-            if days_processed == DEBUG_MAX_DAYS_PER_INVOCATION:
-                break
-
-            if current_date >= DEBUG_MAX_DATE:
+            if s.debug_limit_reached(days_processed, current_date):
                 break
 
             if current_date > last_added_date:
@@ -341,10 +336,7 @@ def generate_pivoted_features(context=None):
             current_date += s.ONE_DAY
 
         if days_processed == 0:
-            return {
-                "statusCode": 200,
-                "body": "no pivoted features computed due to lambda timeout",
-            }
+            return s.result(LOGGER, 200, "nothing computed due to lambda timeout")
 
         pa = pyarrow()
         pivoted_arrays = [
@@ -372,10 +364,7 @@ def generate_pivoted_features(context=None):
             BUCKET, s.STOCK_PREPROC_STATE_KEY, s.LAST_PROCESSED_KEY, new_last_processed
         )
 
-        return {
-            "statusCode": 200,
-            "body": f"finished preprocessing up to and including {new_last_processed.isoformat()}",
-        }
+        return s.result(LOGGER, 200, "finished preprocessing")
 
     except Exception:
         LOGGER.exception("Error in generate_pivoted_features")

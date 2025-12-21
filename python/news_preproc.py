@@ -54,8 +54,6 @@ MODEL_DIR_OR_NAME = os.getenv(
 RETRY_COUNT = int(os.getenv("RETRY_COUNT", "3"))
 RETRY_DELAY_S = float(os.getenv("RETRY_DELAY_S", "0.25"))
 RETRY_MAX_DELAY_S = float(os.getenv("RETRY_MAX_DELAY_S", "2.0"))
-DEBUG_MAX_DATE = date.fromisoformat(os.getenv("DEBUG_MAX_DATE", "2000-11-01"))
-DEBUG_MAX_DAYS_PER_INVOCATION = int(os.getenv("DEBUG_MAX_DAYS_PER_INVOCATION", "-1"))
 
 CONFLICT_THRESHOLD_LOW = 0.05
 CONFLICT_THRESHOLD_HIGH = 0.15
@@ -64,13 +62,11 @@ NEUTRAL_THRESHOLD = 0.1
 PREVENT_DIV_BY_ZERO = 1e-9
 TOKENIZER_MAX_LENGTH = 512
 
-
 TEMP_PREFIX = "tmp/"
 RAW_PREFIX = "raw/news/localDate="
 SENTIMENT_PREFIX = "news/sentiment/localDate="
 AGGREGATED_PREFIX = "news/aggregated/localDate="
 LAGGED_PREFIX = f"news/lagged-{LAG_DAYS}/"
-
 
 LOGGER = s.setup_logger(__file__)
 
@@ -617,7 +613,7 @@ def generate_lagged_features(context=None):
             BUCKET, s.NEWS_COLLECTOR_STATE_KEY, s.LAST_ADDED_KEY
         )
         if last_added_date is None:
-            return {"statusCode": 200, "body": "no raw data to process"}
+            return s.result(LOGGER, 200, "no raw data to process")
 
         default_last_processed_date = START_DATE - s.ONE_DAY
         last_processed_date = s.read_json_date_s3(
@@ -627,7 +623,7 @@ def generate_lagged_features(context=None):
             default_last_processed_date,
         )
         if last_processed_date > last_added_date:
-            return {"statusCode": 200, "body": "all data already processed"}
+            return s.result(LOGGER, 200, "all data already processed")
 
         init_torch()
 
@@ -648,10 +644,7 @@ def generate_lagged_features(context=None):
         days_processed = 0
 
         while s.continue_execution(context, MIN_REMAINING_MS, LOGGER):
-            if days_processed == DEBUG_MAX_DAYS_PER_INVOCATION:
-                break
-
-            if current_date >= DEBUG_MAX_DATE:
+            if s.debug_limit_reached(days_processed, current_date):
                 break
 
             prev_date = current_date - s.ONE_DAY
@@ -672,10 +665,7 @@ def generate_lagged_features(context=None):
             current_date += s.ONE_DAY
 
         if days_processed == 0:
-            return {
-                "statusCode": 200,
-                "body": "no lagged features computed due to lambda timeout",
-            }
+            return s.result(LOGGER, 200, "nothing computed due to lambda timeout")
 
         pa = pyarrow()
         arrays = [
@@ -694,10 +684,8 @@ def generate_lagged_features(context=None):
             BUCKET, s.NEWS_PREPROC_STATE_KEY, s.LAST_PROCESSED_KEY, new_last_processed
         )
 
-        return {
-            "statusCode": 200,
-            "body": f"finished preprocessing up to and including {new_last_processed:%Y-%m-%d}",
-        }
+        return s.result(LOGGER, 200, "finished preprocessing")
+
     except Exception:
         LOGGER.exception("Error in generate_lagged_features")
         return {"statusCode": 500, "body": "error"}

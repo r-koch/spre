@@ -26,6 +26,10 @@ def pyarrow_parquet():
 
 
 # ---------- CONFIG ----------
+DEBUG = bool(os.getenv("DEBUG", "False"))
+DEBUG_MAX_DATE = date.fromisoformat(os.getenv("DEBUG_MAX_DATE", "9999-11-01"))
+DEBUG_MAX_DAYS_PER_INVOCATION = int(os.getenv("DEBUG_MAX_DAYS_PER_INVOCATION", "-1"))
+
 DEFAULT_COMPRESSION_LEVEL = 1
 DEFAULT_MIN_REMAINING_MS = 60_000
 ONE_DAY = timedelta(days=1)
@@ -54,9 +58,8 @@ RETRY_MAX_DELAY_S = float(os.getenv("RETRY_MAX_DELAY_S", "2.0"))
 s3 = boto3.client("s3", region_name=AWS_REGION)
 
 
-# ---------- LOGGING CONFIG ----------
 def setup_logger(name: str):
-    logger = logging.getLogger(name)
+    logger = logging.getLogger(os.path.basename(name))
     if logger.hasHandlers():
         logger.handlers.clear()
 
@@ -75,7 +78,6 @@ def setup_logger(name: str):
     return logger
 
 
-# ---------- LAMBDA ----------
 def continue_execution(
     context=None, min_remaining_ms=DEFAULT_MIN_REMAINING_MS, logger=None
 ):
@@ -90,7 +92,6 @@ def continue_execution(
     return True
 
 
-# ---------- S3 READ/WRITE ----------
 def retry_s3(
     operation,
     retry_count=RETRY_COUNT,
@@ -257,3 +258,21 @@ def read_directory_s3(bucket: str, prefix: str, local_dir: str):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "wb") as f:
             f.write(read_bytes_s3(bucket, key))
+
+
+def debug_limit_reached(days_processed: int, date_to_process: date) -> bool:
+    if not DEBUG:
+        return False
+
+    if days_processed >= DEBUG_MAX_DAYS_PER_INVOCATION:
+        return True
+
+    if date_to_process >= DEBUG_MAX_DATE:
+        return True
+
+    return False
+
+
+def result(logger: logging.Logger, code: int, message: str) -> dict[str, int | str]:
+    logger.info(message)
+    return {"statusCode": code, "body": message}
