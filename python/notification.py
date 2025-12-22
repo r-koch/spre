@@ -13,12 +13,12 @@ import boto3
 AWS_REGION = os.getenv("AWS_REGION", "eu-west-1")
 EMAIL_FROM = os.getenv("EMAIL_FROM", "spre@rkoch.dev")
 EMAIL_TO = os.getenv("EMAIL_TO", "spre@rkoch.dev")
-SYMBOLS = [
+TOP_GAINERS_COUNT = int(os.getenv("TOP_GAINERS_COUNT", "10"))
+WATCHED_SYMBOLS = [
     sym.strip()
     for sym in os.getenv("SYMBOLS", "goog,msft,tsla").split(",")
     if sym.strip()
 ]
-TOP_GAINERS_COUNT = int(os.getenv("TOP_GAINERS_COUNT", "10"))
 
 ses = boto3.client("ses", region_name=AWS_REGION)
 
@@ -127,7 +127,7 @@ def send_email(subject: str, body: str):
 
 
 def notify():
-    if not SYMBOLS:
+    if not WATCHED_SYMBOLS:
         raise ValueError("SYMBOLS env var is empty")
 
     x1 = get_latest_inference_date()
@@ -144,7 +144,7 @@ def notify():
 
     # Predicted gain/loss of watched symbols for day X+1
     lines.append("Watched symbols")
-    for sym in SYMBOLS:
+    for sym in WATCHED_SYMBOLS:
         if sym in inf_x1:
             pred = inf_x1[sym]
             lines.append(f"{sym:<6}  {pred:+.5f}  {classify(pred)}")
@@ -161,7 +161,7 @@ def notify():
     # Predicted vs actual for watched symbols for day X
     lines.append("Watched symbols")
     lines.append("Symbol  Predicted  Actual  Result")
-    for sym in SYMBOLS:
+    for sym in WATCHED_SYMBOLS:
         if sym in inf_x and sym in act_x:
             pred = inf_x[sym]
             act = act_x[sym]
