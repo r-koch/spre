@@ -13,20 +13,22 @@ import shared as s
 import numpy as np
 import pandas as pd
 import pyarrow as pa
-from sklearn.decomposition import PCA
-from tensorflow.keras import layers, Model, Input  # type: ignore
+import tensorflow as tf
+from tensorflow.keras import layers, mixed_precision, Model, Input  # type: ignore
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau  # type: ignore
+from tensorflow.keras.optimizers import Adam  # type: ignore
+from tensorflow.keras.mixed_precision import LossScaleOptimizer  # type: ignore
 
 # --- CONFIG ---
-BATCH = int(os.getenv("BATCH_SIZE", "128"))
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "16"))
 CONSOLIDATED_COMPRESSION_LEVEL = int(os.getenv("CONSOLIDATED_COMPRESSION_LEVEL", "3"))
+EARLY_STOPPING_PATIENCE = int(os.getenv("EARLY_STOPPING_PATIENCE", "15"))
 EPOCHS = int(os.getenv("EPOCHS", "50"))
 PARTIAL_FILE_LIMIT = int(os.getenv("PARTIAL_FILE_LIMIT", "1"))
 if PARTIAL_FILE_LIMIT < 1:
     raise ValueError("PARTIAL_FILE_LIMIT must be > 0")
-PCA_DIMS = int(os.getenv("PCA_DIMS", "64"))
-VAL_DAYS = int(os.getenv("VAL_DAYS", "30"))
-WINDOW = int(os.getenv("WINDOW", "20"))
+VAL_DAYS = int(os.getenv("VAL_DAYS", "120"))
+WINDOW = int(os.getenv("WINDOW", "60"))
 
 LOGGER = s.setup_logger(__file__)
 
@@ -122,29 +124,78 @@ def get_training_and_validation_mask(index: pd.DatetimeIndex, cutoff_date: date)
     return training_mask, validation_mask
 
 
-def make_windows(X: np.ndarray, Y: np.ndarray):
-    xs, ys = [], []
-    for i in range(WINDOW, len(X)):
-        xs.append(X[i - WINDOW : i])
-        ys.append(Y[i])
-    return np.asarray(xs), np.asarray(ys)
+def windowed_dataset(
+    X: np.ndarray,
+    Y: np.ndarray,
+    shuffle: bool,
+):
+    X_ds = tf.data.Dataset.from_tensor_slices(X)
+    Y_ds = tf.data.Dataset.from_tensor_slices(Y)
+
+    # Sliding windows over X
+    X_win = X_ds.window(WINDOW, shift=1, drop_remainder=True).flat_map(
+        lambda w: w.batch(WINDOW)
+    )
+
+    # Targets aligned to window end: Y[i] for X[i-window:i]
+    Y_win = Y_ds.skip(WINDOW)
+
+    ds = tf.data.Dataset.zip((X_win, Y_win))
+
+    if shuffle:
+        ds = ds.shuffle(1024)
+
+    return ds.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
 
 
 def build_model(D: int, out_dim: int) -> Model:
     inp = Input((WINDOW, D))
-    x = layers.Conv1D(64, 3, padding="causal", activation="relu")(inp)
-    x = layers.Conv1D(64, 3, padding="causal", activation="relu")(x)
-    x = layers.Bidirectional(layers.LSTM(128))(x)
+
+    x = layers.Conv1D(filters=128, kernel_size=5, padding="causal", activation="relu")(
+        inp
+    )
+
+    x = layers.Conv1D(filters=128, kernel_size=5, padding="causal", activation="relu")(
+        x
+    )
+
+    # --- long-range dependencies ---
+    x = layers.Bidirectional(
+        layers.LSTM(256, return_sequences=True, dropout=0.2, recurrent_dropout=0.0)
+    )(x)
+
+    x = layers.Bidirectional(
+        layers.LSTM(128, return_sequences=False, dropout=0.2, recurrent_dropout=0.0)
+    )(x)
+
+    # --- cross-asset interaction ---
+    x = layers.Dense(1024, activation="relu")(x)
     x = layers.Dense(512, activation="relu")(x)
-    out = layers.Dense(out_dim, activation="linear")(x)
+
+    out = layers.Dense(out_dim, activation="linear", dtype="float32")(x)
 
     model = Model(inp, out)
-    model.compile(optimizer="adam", loss="mse", metrics=["mae"])
+
+    base_opt = Adam(learning_rate=3e-4)
+    opt = LossScaleOptimizer(base_opt)
+
+    model.compile(optimizer=opt, loss="mse", metrics=["mae"])
     return model
+
+
+def assert_finite(name, arr):
+    if not np.isfinite(arr).all():
+        raise ValueError(f"{name} contains NaN or Inf")
 
 
 def train():
     try:
+        gpus = tf.config.list_physical_devices("GPU")
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+
+        mixed_precision.set_global_policy("mixed_float16")
+
         stock_data, news_data, target_data = get_training_inputs()
 
         cutoff_date = s.get_last_processed_date()
@@ -156,33 +207,51 @@ def train():
         X_stock_train = stock_data.loc[train_mask].values
         X_stock_val = stock_data.loc[val_mask].values
 
-        pca = PCA(n_components=PCA_DIMS)
-        Xp_train = pca.fit_transform(X_stock_train)
-        Xp_val = pca.transform(X_stock_val)
-
         X_news_train = news_data.loc[train_mask].values
         X_news_val = news_data.loc[val_mask].values
 
-        X_train = np.hstack([Xp_train, X_news_train])
-        X_val = np.hstack([Xp_val, X_news_val])
+        X_train = np.hstack([X_stock_train, X_news_train])
+        X_val = np.hstack([X_stock_val, X_news_val])
+
+        mean = X_train.mean(axis=0, keepdims=True)
+        std = X_train.std(axis=0, keepdims=True) + 1e-6
+
+        X_train = (X_train - mean) / std
+        X_val = (X_val - mean) / std
 
         Y_train = target_data.loc[train_mask].values
         Y_val = target_data.loc[val_mask].values
 
-        Xtr_w, Ytr_w = make_windows(X_train, Y_train)
-        Xv_w, Yv_w = make_windows(X_val, Y_val)
+        assert_finite("X_train", X_train)
+        assert_finite("Y_train", Y_train)
+        assert_finite("X_val", X_val)
+        assert_finite("Y_val", Y_val)
 
-        model = build_model(Xtr_w.shape[2], Ytr_w.shape[1])
+        LOGGER.info(f"Training windows shape: {X_train.shape}")
+
+        train_ds = windowed_dataset(X_train, Y_train, shuffle=True).repeat()
+
+        val_ds = windowed_dataset(X_val, Y_val, shuffle=False)
+
+        num_train_windows = len(X_train) - WINDOW
+        steps_per_epoch = num_train_windows // BATCH_SIZE
+
+        num_val_windows = len(X_val) - WINDOW
+        validation_steps = max(1, num_val_windows // BATCH_SIZE)
+
+        model = build_model(X_train.shape[1], Y_train.shape[1])
 
         model.fit(
-            Xtr_w,
-            Ytr_w,
-            validation_data=(Xv_w, Yv_w),
+            train_ds,
+            validation_data=val_ds,
             epochs=EPOCHS,
-            batch_size=BATCH,
+            steps_per_epoch=steps_per_epoch,
+            validation_steps=validation_steps,
             callbacks=[
                 EarlyStopping(
-                    patience=6, restore_best_weights=True, monitor="val_loss"
+                    patience=EARLY_STOPPING_PATIENCE,
+                    restore_best_weights=True,
+                    monitor="val_loss",
                 ),
                 ReduceLROnPlateau(patience=3, factor=0.5, monitor="val_loss"),
             ],
@@ -201,13 +270,6 @@ def train():
             model_key = f"{base_prefix}{s.MODEL_FILE_NAME}"
             s.write_bytes_s3(model_key, model_data)
 
-        buffer = BytesIO()
-        pickle.dump(pca, buffer, protocol=pickle.HIGHEST_PROTOCOL)
-        pca_data = buffer.getvalue()
-
-        pca_key = f"{base_prefix}{s.PCA_FILE_NAME}"
-        s.write_bytes_s3(pca_key, pca_data)
-
         meta = {
             "trainingCutoff": model_date,
             "trainingRange": [
@@ -219,7 +281,6 @@ def train():
                 str(stock_data.index[val_mask].max()),
             ],
             "windowSize": WINDOW,
-            "pcaDimensions": PCA_DIMS,
             "features": {
                 "stock": stock_data.shape[1],
                 "news": news_data.shape[1],
