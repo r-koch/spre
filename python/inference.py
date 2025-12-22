@@ -85,7 +85,7 @@ def infer(inference_date: date | None = None):
 
     norm = meta["normalization"]
     mean = np.asarray(norm["mean"], dtype=FLOAT_32)
-    std  = np.asarray(norm["std"],  dtype=FLOAT_32)
+    std = np.asarray(norm["std"], dtype=FLOAT_32)
 
     window_size = meta["windowSize"]
 
