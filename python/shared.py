@@ -65,7 +65,6 @@ LAGGED_PREFIX = f"news/lagged-{LAG_DAYS}/"
 
 MODEL_PREFIX = "model/localDate="
 MODEL_FILE_NAME = "model.keras"
-PCA_FILE_NAME = "pca.pkl"
 META_FILE_NAME = "meta.json"
 
 INFERENCE_PREFIX = "inference/localDate="

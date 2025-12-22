@@ -17,6 +17,8 @@ from tensorflow.keras import models  # type: ignore
 # --- CONFIG ---
 FLOAT_32 = np.float32
 
+LOGGER = s.setup_logger(__file__)
+
 
 def get_model_prefix() -> str:
     model_date = s.read_json_date_s3(s.TRAINING_STATE_KEY, s.LAST_TRAINED_KEY)
@@ -25,7 +27,6 @@ def get_model_prefix() -> str:
 
 def load_model_artifacts(model_prefix: str):
     model_key = f"{model_prefix}{s.MODEL_FILE_NAME}"
-    pca_key = f"{model_prefix}{s.PCA_FILE_NAME}"
     meta_key = f"{model_prefix}{s.META_FILE_NAME}"
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -37,13 +38,10 @@ def load_model_artifacts(model_prefix: str):
 
         model = models.load_model(local_model_path, compile=False)
 
-    pca_data = s.read_bytes_s3(pca_key)
-    pca = pickle.loads(pca_data)
-
     meta_data = s.read_bytes_s3(meta_key)
     meta = json.loads(meta_data.decode("utf-8"))
 
-    return model, pca, meta
+    return model, meta
 
 
 def load_window(prefix: str, schema, end_date: date, window_size: int) -> np.ndarray:
@@ -73,16 +71,6 @@ def load_window(prefix: str, schema, end_date: date, window_size: int) -> np.nda
     return np.asarray(rows, dtype=FLOAT_32)
 
 
-def build_model_input(
-    stock_window: np.ndarray, news_window: np.ndarray, pca
-) -> np.ndarray:
-    stock_pca = pca.transform(stock_window)
-
-    x = np.concatenate([stock_pca, news_window], axis=1)
-
-    return x.reshape(1, *x.shape)
-
-
 def infer(inference_date: date | None = None):
     last_processed_date = s.get_last_processed_date()
     max_inference_date = last_processed_date + s.ONE_DAY
@@ -93,7 +81,11 @@ def infer(inference_date: date | None = None):
     end_date = inference_date - s.ONE_DAY
 
     model_prefix = get_model_prefix()
-    model, pca, meta = load_model_artifacts(model_prefix)
+    model, meta = load_model_artifacts(model_prefix)
+
+    norm = meta["normalization"]
+    mean = np.asarray(norm["mean"], dtype=FLOAT_32)
+    std  = np.asarray(norm["std"],  dtype=FLOAT_32)
 
     window_size = meta["windowSize"]
 
@@ -110,9 +102,14 @@ def infer(inference_date: date | None = None):
         window_size,
     )
 
-    x = build_model_input(stock_window, news_window, pca)
+    x = np.concatenate([stock_window, news_window], axis=1)
+    x = (x - mean) / std
+    x = x.reshape(1, *x.shape)
 
     preds = model.predict(x, verbose=0)[0].astype(FLOAT_32)
+
+    if not np.isfinite(preds).all():
+        raise ValueError("Inference produced NaN/Inf predictions")
 
     symbols = s.get_symbols()
 
@@ -137,8 +134,10 @@ def infer(inference_date: date | None = None):
     inference_meta_key = f"{s.INFERENCE_PREFIX}{inference_date.isoformat()}/meta.json"
     inference_meta_data = json.dumps(inference_meta, indent=2).encode("utf-8")
     s.write_bytes_s3(inference_meta_key, inference_meta_data)
+    LOGGER.info(f"finished inference for {inference_date}")
 
 
 # --- ENTRY POINT ---
 if __name__ == "__main__":
+    infer(date.fromisoformat("2025-12-19"))
     infer()

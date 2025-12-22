@@ -285,6 +285,10 @@ def train():
                 "stock": stock_data.shape[1],
                 "news": news_data.shape[1],
             },
+            "normalization": {
+                "mean": mean.astype("float32").tolist(),
+                "std": std.astype("float32").tolist(),
+            },
         }
         meta_data = json.dumps(meta, indent=2).encode("utf-8")
 
@@ -292,6 +296,8 @@ def train():
         s.write_bytes_s3(meta_key, meta_data)
 
         s.write_json_date_s3(s.TRAINING_STATE_KEY, s.LAST_TRAINED_KEY, cutoff_date)
+
+        LOGGER.info("finished training")
 
     except Exception:
         LOGGER.exception("Error in train")
