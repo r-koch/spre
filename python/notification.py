@@ -1,4 +1,5 @@
 # --- STANDARD ---
+import heapq
 import json
 import os
 from datetime import date
@@ -20,30 +21,40 @@ WATCHED_SYMBOLS = [
     if sym.strip()
 ]
 
-ses = boto3.client("ses", region_name=AWS_REGION)
+LOGGER = s.setup_logger(__file__)
+
+SES_CLIENT = boto3.client("ses", region_name=AWS_REGION)
 
 
-def get_latest_inference_date() -> date:
-    keys = s.list_keys_s3(s.INFERENCE_PREFIX, sort_reversed=True)
-    if not keys:
-        raise ValueError("No inference data found")
+def get_inferences() -> tuple[
+    tuple[date, dict[str, float]],
+    tuple[date, dict[str, float]],
+]:
+    keys = [
+        k
+        for k in s.list_keys_s3(s.INFERENCE_PREFIX, sort_reversed=True)
+        if k.endswith("/data.parquet")
+    ]
 
-    # inference/localDate=YYYY-MM-DD/data.parquet
-    for key in keys:
-        if key.endswith("/data.parquet"):
-            date_str = key.split(s.INFERENCE_PREFIX)[1].split("/")[0]
-            return date.fromisoformat(date_str)
+    if len(keys) < 2:
+        raise ValueError(f"Expected at least 2 inference files, found {len(keys)}")
 
-    raise ValueError("No inference parquet found")
-
-
-def get_inference(py_date: date) -> dict[str, float]:
-    key = f"{s.INFERENCE_PREFIX}{py_date.isoformat()}/data.parquet"
     schema = s.get_inference_schema()
-    table = s.read_parquet_s3(key, schema)
-    symbols = table["symbol"].to_pylist()
-    preds = table["predicted_log_return"].to_pylist()
-    return dict(zip(symbols, preds))
+
+    def load(key: str) -> tuple[date, dict[str, float]]:
+        # inference/localDate=YYYY-MM-DD/data.parquet
+        date_str = key.split(s.INFERENCE_PREFIX, 1)[1].split("/", 1)[0]
+
+        table = s.read_parquet_s3(key, schema)
+        symbols = table["symbol"].to_pylist()
+        preds = table["predicted_log_return"].to_pylist()
+
+        return date.fromisoformat(date_str), dict(zip(symbols, preds))
+
+    latest = load(keys[0])
+    previous = load(keys[1])
+
+    return latest, previous
 
 
 def get_returns(py_date: date) -> dict[str, float]:
@@ -66,15 +77,11 @@ def get_returns(py_date: date) -> dict[str, float]:
     raise ValueError(f"No actual returns for {py_date}")
 
 
-def classify(value: float) -> str:
-    return "GAIN" if value > 0.0 else "LOSS"
+def get_top_gainers(pred: dict[str, float]) -> list[tuple[str, float]]:
+    return heapq.nlargest(TOP_GAINERS_COUNT, pred.items(), key=lambda kv: kv[1])
 
 
-def top_k(pred: dict[str, float], k: int):
-    return sorted(pred.items(), key=lambda kv: kv[1], reverse=True)[:k]
-
-
-def directional_accuracy(pred: dict[str, float], actual: dict[str, float]):
+def get_directional_accuracy(pred: dict[str, float], actual: dict[str, float]):
     correct = 0
     total = 0
     for sym, p in pred.items():
@@ -85,38 +92,26 @@ def directional_accuracy(pred: dict[str, float], actual: dict[str, float]):
     return correct, total
 
 
-def top_k_hit_rate(pred: dict[str, float], actual: dict[str, float], k: int):
+def get_top_gainers_hit_rate(
+    top_gainers: list[tuple[str, float]], actual: dict[str, float]
+):
     hits = 0
-    for sym, _ in top_k(pred, k):
+    for sym, _ in top_gainers:
         if sym in actual and actual[sym] > 0:
             hits += 1
     return hits
 
 
-def sign(x: float) -> int:
-    if x > 0.0:
+def sign(value: float) -> int:
+    if value > 0.0:
         return 1
-    if x < 0.0:
+    if value < 0.0:
         return -1
     return 0
 
 
-def format_email(inference_date: date, rows: list[dict]) -> str:
-    lines = [
-        f"Stock prediction for {inference_date.isoformat()}",
-        "",
-        "Symbol    Prediction    Direction",
-        "-" * 36,
-    ]
-
-    for r in rows:
-        lines.append(f"{r['symbol']:<8}  {r['pred']:+.5f}      {r['direction']}")
-
-    return "\n".join(lines)
-
-
 def send_email(subject: str, body: str):
-    ses.send_email(
+    SES_CLIENT.send_email(
         Source=EMAIL_FROM,
         Destination={"ToAddresses": [EMAIL_TO]},
         Message={
@@ -127,68 +122,73 @@ def send_email(subject: str, body: str):
 
 
 def notify():
-    if not WATCHED_SYMBOLS:
-        raise ValueError("SYMBOLS env var is empty")
+    try:
+        if not WATCHED_SYMBOLS:
+            raise ValueError("SYMBOLS env var is empty")
 
-    x1 = get_latest_inference_date()
-    x = x1 - s.ONE_DAY
+        (latest_date, latest_pred), (previous_date, previous_pred) = get_inferences()
 
-    inf_x1 = get_inference(x1)
-    inf_x = get_inference(x)
+        previous_actual = get_returns(previous_date)
 
-    act_x = get_returns(x)
+        lines = []
 
-    lines = []
+        lines.append(f"{latest_date} prediction")
 
-    lines.append(f"{x1} prediction")
+        # Predicted gain/loss of watched symbols for day X+1
+        lines.append("Watched symbols")
+        for sym in WATCHED_SYMBOLS:
+            if sym in latest_pred:
+                pred = latest_pred[sym]
+                lines.append(
+                    f"{sym:<6}  {pred:+.5f}  {"GAIN" if sign(pred) > 0 else "LOSS"}"
+                )
+        lines.append("")
 
-    # Predicted gain/loss of watched symbols for day X+1
-    lines.append("Watched symbols")
-    for sym in WATCHED_SYMBOLS:
-        if sym in inf_x1:
-            pred = inf_x1[sym]
-            lines.append(f"{sym:<6}  {pred:+.5f}  {classify(pred)}")
-    lines.append("")
+        # Top K predicted gainers for day X+1
+        top_gainers = get_top_gainers(latest_pred)
+        lines.append(f"Top-{TOP_GAINERS_COUNT} gainers")
+        for sym, val in top_gainers:
+            lines.append(f"{sym:<6}  {val:+.5f}")
+        lines.append("")
 
-    # Top K predicted gainers for day X+1
-    lines.append(f"Top-{TOP_GAINERS_COUNT} gainers")
-    for sym, val in top_k(inf_x1, TOP_GAINERS_COUNT):
-        lines.append(f"{sym:<6}  {val:+.5f}")
-    lines.append("")
+        lines.append(f"{previous_date} predicted vs actual")
 
-    lines.append(f"{x} predicted vs actual")
+        # Predicted vs actual for watched symbols for day X
+        lines.append("Watched symbols")
+        lines.append("Symbol  Predicted  Actual  Result")
+        for sym in WATCHED_SYMBOLS:
+            if sym in previous_pred and sym in previous_actual:
+                pred = previous_pred[sym]
+                act = previous_actual[sym]
+                lines.append(
+                    f"{sym:<6}  {pred:+.5f}  {act:+.5f}  {'OK' if sign(pred) == sign(act) else 'FAIL'}"
+                )
+        lines.append("")
 
-    # Predicted vs actual for watched symbols for day X
-    lines.append("Watched symbols")
-    lines.append("Symbol  Predicted  Actual  Result")
-    for sym in WATCHED_SYMBOLS:
-        if sym in inf_x and sym in act_x:
-            pred = inf_x[sym]
-            act = act_x[sym]
-            lines.append(
-                f"{sym:<6}  {pred:+.5f}  {act:+.5f}  {'OK' if sign(pred) == sign(act) else 'FAIL'}"
-            )
-    lines.append("")
+        # Directional accuracy overall for day X
+        correct, total = get_directional_accuracy(previous_pred, previous_actual)
+        pct = (correct / total * 100.0) if total else 0.0
+        lines.append(f"Directional accuracy: {correct} / {total} ({pct:.1f}%)")
 
-    # Directional accuracy overall for day X
-    correct, total = directional_accuracy(inf_x, act_x)
-    pct = (correct / total * 100.0) if total else 0.0
-    lines.append(f"Directional accuracy: {correct} / {total} ({pct:.1f}%)")
+        # Top K hit rate for day X
+        hits = get_top_gainers_hit_rate(top_gainers, previous_actual)
+        lines.append(
+            f"Top-{TOP_GAINERS_COUNT} hit rate:      {hits} / {TOP_GAINERS_COUNT}"
+        )
+        lines.append("")
 
-    # Top K hit rate for day X
-    hits = top_k_hit_rate(inf_x, act_x, TOP_GAINERS_COUNT)
-    lines.append(f"Top-{TOP_GAINERS_COUNT} hit rate:      {hits} / {TOP_GAINERS_COUNT}")
-    lines.append("")
+        body = "\n".join(lines)
+        subject = f"{latest_date} spre"
 
-    body = "\n".join(lines)
-    subject = f"{x1} spre"
+        send_email(subject, body)
 
-    send_email(subject, body)
-
-    return {
-        "statusCode": 200,
-        "body": json.dumps({"date": x.isoformat()}),
-    }
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"date": latest_date.isoformat()}),
+        }
+    except Exception:
+        LOGGER.exception("Error in notify")
+        return {"statusCode": 500, "body": "error"}
 
 
 # --- LAMBDA ---
