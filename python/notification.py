@@ -182,10 +182,8 @@ def notify():
 
         send_email(subject, body)
 
-        return {
-            "statusCode": 200,
-            "body": json.dumps({"date": latest_date.isoformat()}),
-        }
+        return s.result(LOGGER, 200, f"sent notification for {latest_date}")
+
     except Exception:
         LOGGER.exception("Error in notify")
         return {"statusCode": 500, "body": "error"}
