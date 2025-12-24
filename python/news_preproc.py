@@ -52,9 +52,10 @@ NEUTRAL_THRESHOLD = 0.1
 PREVENT_DIV_BY_ZERO = 1e-9
 TOKENIZER_MAX_LENGTH = 512
 
-RAW_PREFIX = "raw/news/localDate="
-SENTIMENT_PREFIX = "news/sentiment/localDate="
-AGGREGATED_PREFIX = "news/aggregated/localDate="
+LOCAL_DATE = s.LOCAL_DATE
+RAW_PREFIX = f"raw/news/{LOCAL_DATE}="
+SENTIMENT_PREFIX = f"news/sentiment/{LOCAL_DATE}="
+AGGREGATED_PREFIX = f"news/aggregated/{LOCAL_DATE}="
 
 MIN_REMAINING_MS = int(os.getenv("MIN_REMAINING_MS", "240000"))
 MODEL_DIR_OR_NAME = os.getenv(
@@ -113,7 +114,7 @@ def get_raw_schema():
         pa = pyarrow()
         _raw_schema = pa.schema(
             {
-                "localDate": pa.date32(),
+                LOCAL_DATE: pa.date32(),
                 "id": pa.string(),
                 "title": pa.string(),
                 "body": pa.string(),
@@ -132,7 +133,7 @@ def get_sentiment_schema():
         pa = pyarrow()
         _sentiment_schema = pa.schema(
             {
-                "localDate": pa.date32(),
+                LOCAL_DATE: pa.date32(),
                 "id": pa.string(),
                 "sentiment_score": pa.float32(),
                 "text_length": pa.int32(),
@@ -535,7 +536,7 @@ def append_lagged_row(
     aggregated_columns: list,
     lagged_column_names: list[list[str]],
 ):
-    lagged_columns["localDate"].append(py_date)
+    lagged_columns[LOCAL_DATE].append(py_date)
 
     for aggregated_values, lagged_cols in zip(rolling_window, lagged_column_names):
         for col, lagged_col in zip(aggregated_columns, lagged_cols):
@@ -599,7 +600,9 @@ def generate_lagged_features(context=None):
             current_date += s.ONE_DAY
 
         if days_processed == 0:
-            return s.result(LOGGER, 200, "nothing computed due to lambda timeout")
+            return s.result(
+                LOGGER, 200, "nothing computed. lambda timeout or debug limit too low"
+            )
 
         pa = pyarrow()
         arrays = [
@@ -613,7 +616,7 @@ def generate_lagged_features(context=None):
 
         s.write_parquet_s3(lagged_key, lagged_table, lagged_schema)
 
-        new_last_processed = lagged_table["localDate"].to_pylist()[-1]
+        new_last_processed = lagged_table[LOCAL_DATE].to_pylist()[-1]
         s.write_json_date_s3(
             s.NEWS_PREPROC_STATE_KEY, s.LAST_PROCESSED_KEY, new_last_processed
         )
