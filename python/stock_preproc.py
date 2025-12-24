@@ -177,27 +177,32 @@ def get_previous_closes(last_processed: date, schema):
     np = numpy()
     close_cols = get_close_column()
 
-    pivoted_table = s.read_parquet_s3(keys[0], schema)
-    assert pivoted_table is not None
-
-    if pivoted_table["localDate"][-1].as_py() == last_processed:
-        return np.array(
-            [pivoted_table[col][-1].as_py() for col in close_cols],
-            dtype="float32",
-        )
-
-    pa = pyarrow()
     for key in keys:
         pivoted_table = s.read_parquet_s3(key, schema)
         assert pivoted_table is not None
 
-        indices = (pivoted_table["localDate"] == pa.scalar(last_processed)).nonzero()[0]
-        if len(indices) == 1:
-            row_idx = indices[0].as_py()
+        dates = pivoted_table["localDate"]
+
+        # fast path: last row match
+        if dates[-1].as_py() == last_processed:
             return np.array(
-                [pivoted_table[col][row_idx].as_py() for col in close_cols],
+                [pivoted_table[col][-1].as_py() for col in close_cols],
                 dtype="float32",
             )
+
+        # reverse chunk-wise scan
+        for chunk in reversed(dates.chunks):
+            for i in range(len(chunk) - 1, -1, -1):
+                d = chunk[i].as_py()
+
+                if d == last_processed:
+                    return np.array(
+                        [pivoted_table[col][i].as_py() for col in close_cols],
+                        dtype="float32",
+                    )
+
+                if d < last_processed:
+                    break  # older than target → stop scanning this file
 
     raise ValueError(f"no pivoted data found for {last_processed}")
 
@@ -260,12 +265,14 @@ def generate_pivoted_features(context=None):
 
                 previous_closes = curr_closes
                 days_processed += 1
+                LOGGER.info(f"Computed pivoted + target features for {current_date}")
 
-            LOGGER.info(f"Computed pivoted + target features for {current_date}")
             current_date += s.ONE_DAY
 
         if days_processed == 0:
-            return s.result(LOGGER, 200, "nothing computed due to lambda timeout")
+            return s.result(
+                LOGGER, 200, "nothing computed. lambda timeout or debug limit too low"
+            )
 
         pa = pyarrow()
         pivoted_arrays = [
