@@ -69,7 +69,7 @@ def get_model_and_meta():
     return model, meta
 
 
-def get_latest_pivoted_date_before(inference_date: date) -> date | None:
+def get_latest_pivoted_date_before(inference_date: date) -> date:
     keys = s.list_keys_s3(s.PIVOTED_PREFIX, sort_reversed=True)
     for key in keys:
         table = s.read_parquet_column_s3(key, [s.LOCAL_DATE])
@@ -81,7 +81,7 @@ def get_latest_pivoted_date_before(inference_date: date) -> date | None:
                 if d < inference_date:
                     return d
 
-    return None
+    raise ValueError(f"no pivoted date found before {inference_date}")
 
 
 def load_window(prefix: str, schema, end_date: date, window_size: int):
@@ -131,7 +131,7 @@ def read_single_row_for_date(prefix: str, schema, target_date: date):
     raise ValueError(f"Row not found for date {target_date}")
 
 
-def get_next_inference_date(last: date) -> date:
+def get_next_weekday(last: date) -> date:
     next = last + timedelta(days=1)
     while next.weekday() >= 5:  # 5=Sat, 6=Sun
         next += timedelta(days=1)
@@ -140,17 +140,14 @@ def get_next_inference_date(last: date) -> date:
 
 def infer(context=None):
     try:
-
+        max_inference_date = get_next_weekday(s.get_last_processed_date())
         last_inferred_date = s.read_json_date_s3(
             s.INFERENCE_STATE_KEY,
             LAST_INFERED_KEY,
             DEFAULT_LAST_INFERED_DATE,
         )
-
-        inference_date = get_next_inference_date(last_inferred_date)
-
-        end_date = get_latest_pivoted_date_before(inference_date)
-        if end_date is None:
+        inference_date = get_next_weekday(last_inferred_date)
+        if inference_date > max_inference_date:
             return s.result(LOGGER, 200, "inference is up to date")
 
         np = numpy()
@@ -166,16 +163,15 @@ def infer(context=None):
 
         mean_stock = mean[:, :stock_feature_count]
         mean_news = mean[:, stock_feature_count:]
-
         std_stock = std[:, :stock_feature_count]
         std_news = std[:, stock_feature_count:]
 
         symbols = s.get_symbols()
-
         pivoted_schema = s.get_pivoted_schema()
         lagged_schema = s.get_lagged_schema()
         inference_schema = s.get_inference_schema()
 
+        end_date = get_latest_pivoted_date_before(inference_date)
         stock_window = load_window(
             s.PIVOTED_PREFIX, pivoted_schema, end_date, window_size
         )
@@ -185,21 +181,10 @@ def infer(context=None):
         num_stock_features = stock_window.shape[1]
         num_news_features = news_window.shape[1]
 
-        assert num_stock_features == stock_feature_count, (
-            f"Stock feature mismatch: training={stock_feature_count}, "
-            f"inference={num_stock_features}"
-        )
+        assert num_stock_features == stock_feature_count
+        assert num_stock_features + num_news_features == mean.shape[1]
 
-        expected_total = mean.shape[1]
-        assert num_stock_features + num_news_features == expected_total, (
-            f"Total feature mismatch: training={expected_total}, "
-            f"inference={num_stock_features + num_news_features}"
-        )
-
-        x = np.empty(
-            (num_rows, num_stock_features + num_news_features),
-            dtype=np.float32,
-        )
+        x = np.empty((num_rows, mean.shape[1]), dtype=np.float32)
 
         while s.continue_execution(context, logger=LOGGER):
 
@@ -207,7 +192,6 @@ def infer(context=None):
             x[:, stock_feature_count:] = (news_window - mean_news) / std_news
 
             x_reshaped = x.reshape(1, *x.shape)
-
             preds = model(x_reshaped, training=False).numpy()[0].astype(np.float32)
 
             if not np.isfinite(preds).all():
@@ -237,15 +221,18 @@ def infer(context=None):
             )
             inference_meta_data = json.dumps(inference_meta, indent=2).encode("utf-8")
             s.write_bytes_s3(inference_meta_key, inference_meta_data)
+
             s.write_json_date_s3(
                 s.INFERENCE_STATE_KEY, LAST_INFERED_KEY, inference_date
             )
             LOGGER.info(f"finished inference for {inference_date}")
 
-            inference_date = get_next_inference_date(inference_date)
-            end_date = get_latest_pivoted_date_before(inference_date)
-            if end_date is None:
+            inference_date = get_next_weekday(inference_date)
+
+            if inference_date > max_inference_date:
                 break
+
+            end_date = get_latest_pivoted_date_before(inference_date)
 
             new_stock_row = read_single_row_for_date(
                 s.PIVOTED_PREFIX, pivoted_schema, end_date
@@ -254,7 +241,6 @@ def infer(context=None):
                 s.LAGGED_PREFIX, lagged_schema, end_date
             )
 
-            # slide windows (drop oldest, append newest)
             stock_window[:-1] = stock_window[1:]
             stock_window[-1] = new_stock_row
 
