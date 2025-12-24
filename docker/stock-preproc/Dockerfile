@@ -1,9 +1,6 @@
 # Base image — slim, Lambda-compatible
 FROM public.ecr.aws/lambda/python:3.14
 
-# Install minimal system dependencies
-RUN dnf install -y git && dnf clean all
-
 # Upgrade pip, setuptools, wheel to avoid build issues
 RUN pip install --upgrade pip setuptools wheel
 
