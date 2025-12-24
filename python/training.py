@@ -227,6 +227,12 @@ def train():
         assert_finite("X_val", X_val)
         assert_finite("Y_val", Y_val)
 
+        stock_feature_count = X_stock_train.shape[1]
+        news_feature_count = X_news_train.shape[1]
+        total_feature_count = stock_feature_count + news_feature_count
+
+        assert X_train.shape[1] == total_feature_count
+
         LOGGER.info(f"Training windows shape: {X_train.shape}")
 
         train_ds = windowed_dataset(X_train, Y_train, shuffle=True).repeat()
@@ -270,6 +276,11 @@ def train():
             model_key = f"{base_prefix}{s.MODEL_FILE_NAME}"
             s.write_bytes_s3(model_key, model_data)
 
+        if mean.shape[1] != total_feature_count:
+            raise ValueError(
+                "Normalization vector length does not match feature layout"
+            )
+
         meta = {
             "trainingCutoff": model_date,
             "trainingRange": [
@@ -288,6 +299,9 @@ def train():
             "normalization": {
                 "mean": mean.astype("float32").tolist(),
                 "std": std.astype("float32").tolist(),
+                "stockFeatureCount": int(stock_feature_count),
+                "newsFeatureCount": int(news_feature_count),
+                "totalFeatureCount": int(total_feature_count),
             },
         }
         meta_data = json.dumps(meta, indent=2).encode("utf-8")
