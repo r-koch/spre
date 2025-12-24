@@ -36,7 +36,7 @@ def pyarrow_parquet():
 
 
 # ---------- CONFIG ----------
-DEBUG = bool(os.getenv("DEBUG", "False"))
+DEBUG = bool(os.getenv("DEBUG", ""))  # set non-empty for True
 DEBUG_MAX_DATE = date.fromisoformat(os.getenv("DEBUG_MAX_DATE", "9999-11-01"))
 DEBUG_MAX_DAYS_PER_INVOCATION = int(os.getenv("DEBUG_MAX_DAYS_PER_INVOCATION", "-1"))
 
