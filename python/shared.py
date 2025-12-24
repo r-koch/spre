@@ -49,6 +49,7 @@ LAST_PROCESSED_KEY = "lastProcessed"
 LAST_TRAINED_KEY = "lastTrained"
 
 META_DATA = "metadata/"
+INFERENCE_STATE_KEY = f"{META_DATA}inference_state.json"
 NEWS_COLLECTOR_STATE_KEY = f"{META_DATA}news_collector_state.json"
 NEWS_PREPROC_STATE_KEY = f"{META_DATA}news_preproc_state.json"
 STOCK_COLLECTOR_STATE_KEY = f"{META_DATA}stock_collector_state.json"
@@ -63,11 +64,13 @@ TARGET_LOG_RETURNS_PREFIX = "stock/target-log-returns/"
 LAG_DAYS = int(os.getenv("LAG_DAYS", "5"))
 LAGGED_PREFIX = f"news/lagged-{LAG_DAYS}/"
 
-MODEL_PREFIX = "model/localDate="
+LOCAL_DATE = "localDate"
+
+MODEL_PREFIX = f"model/{LOCAL_DATE}="
 MODEL_FILE_NAME = "model.keras"
 META_FILE_NAME = "meta.json"
 
-INFERENCE_PREFIX = "inference/localDate="
+INFERENCE_PREFIX = f"inference/{LOCAL_DATE}="
 
 AWS_REGION = os.getenv("AWS_REGION", "eu-west-1")
 BUCKET = os.getenv("BUCKET", "dev-rkoch-spre")
@@ -116,7 +119,7 @@ def get_aggregated_schema():
         pa = pyarrow()
         _aggregated_schema = pa.schema(
             {
-                "localDate": pa.date32(),
+                LOCAL_DATE: pa.date32(),
                 "count_articles": pa.int32(),
                 "mean_sentiment": pa.float32(),
                 "median_sentiment": pa.float32(),
@@ -145,7 +148,7 @@ def get_aggregated_columns() -> list[str]:
     global _aggregated_columns
     if _aggregated_columns is None:
         _aggregated_columns = [
-            name for name in get_aggregated_schema().names if name != "localDate"
+            name for name in get_aggregated_schema().names if name != LOCAL_DATE
         ]
     return _aggregated_columns
 
@@ -157,7 +160,7 @@ def get_lagged_schema():
     global _lagged_schema
     if _lagged_schema is None:
         pa = pyarrow()
-        fields = [pa.field("localDate", pa.date32())]
+        fields = [pa.field(LOCAL_DATE, pa.date32())]
         aggregated_columns = get_aggregated_columns()
         for lag in range(1, LAG_DAYS + 1):
             for col in aggregated_columns:
@@ -174,7 +177,7 @@ def get_pivoted_schema():
     global _pivoted_schema
     if _pivoted_schema is None:
         pa = pyarrow()
-        fields = [pa.field("localDate", pa.date32())]
+        fields = [pa.field(LOCAL_DATE, pa.date32())]
         for sym in get_symbols():
             fields.extend(
                 [
@@ -196,7 +199,7 @@ def get_target_schema():
     global _target_schema
     if _target_schema is None:
         pa = pyarrow()
-        fields = [pa.field("localDate", pa.date32())]
+        fields = [pa.field(LOCAL_DATE, pa.date32())]
         for sym in get_symbols():
             fields.append(pa.field(f"{sym}_return", pa.float32()))
         _target_schema = pa.schema(fields)
@@ -212,7 +215,7 @@ def get_inference_schema():
         pa = pyarrow()
         _inference_schema = pa.schema(
             {
-                "localDate": pa.date32(),
+                LOCAL_DATE: pa.date32(),
                 "symbol": pa.string(),
                 "predicted_log_return": pa.float32(),
             }
@@ -300,6 +303,17 @@ def read_parquet_s3(key: str, schema):
         raise ValueError(
             f"Schema mismatch for {key}. Expected {schema}, got {table.schema}"
         )
+
+    return table
+
+
+def read_parquet_column_s3(key: str, columns: list):
+    data = read_bytes_s3(key)
+    buffer = BytesIO(data)
+    try:
+        table = pyarrow_parquet().read_table(buffer, columns=columns)
+    except Exception as e:
+        raise ValueError(f"Corrupted parquet at {key}: {e}")
 
     return table
 
