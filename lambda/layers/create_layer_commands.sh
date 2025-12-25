@@ -1,3 +1,5 @@
+# in <name>-layer
+
 docker run -it --rm \
   --user "$(id -u):$(id -g)" \
   --entrypoint bash \
@@ -9,7 +11,7 @@ docker run -it --rm \
 cd /build
 mkdir -p python/lib/python3.14/site-packages
 
-pip install pyarrow \
+pip install <name> \
   --target python/lib/python3.14/site-packages \
   --no-cache-dir
 
@@ -17,11 +19,11 @@ exit
 
 # optional find python | head -20
 
-zip -r pyarrow-layer.zip python
+zip -r <name>-layer.zip python
 
 aws lambda publish-layer-version \
-  --layer-name pyarrow \
-  --zip-file fileb://pyarrow-layer.zip \
+  --layer-name <name> \
+  --zip-file fileb://<name>-layer.zip \
   --compatible-runtimes python3.14 \
   --region eu-west-1
 
