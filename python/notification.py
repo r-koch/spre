@@ -57,7 +57,7 @@ def get_inferences() -> tuple[
 
 
 def get_returns(py_date: date) -> dict[str, float]:
-    keys = s.list_keys_s3(s.TARGET_LOG_RETURNS_PREFIX, sort_reversed=True)
+    keys = s.list_keys_s3(s.TARGET_PREFIX, sort_reversed=True)
     schema = s.get_target_schema()
 
     for key in keys:

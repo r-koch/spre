@@ -38,7 +38,7 @@ def pyarrow_parquet():
 # ---------- CONFIG ----------
 DEBUG = bool(os.getenv("DEBUG", ""))  # set non-empty for True
 DEBUG_MAX_DATE = date.fromisoformat(os.getenv("DEBUG_MAX_DATE", "9999-11-01"))
-DEBUG_MAX_DAYS_PER_INVOCATION = int(os.getenv("DEBUG_MAX_DAYS_PER_INVOCATION", "-1"))
+DEBUG_MAX_DAYS_PER_INVOCATION = int(os.getenv("DEBUG_MAX_DAYS_PER_INVOCATION", "10"))
 
 DEFAULT_COMPRESSION_LEVEL = 1
 DEFAULT_MIN_REMAINING_MS = 60_000
@@ -59,7 +59,7 @@ TRAINING_STATE_KEY = f"{META_DATA}training_state.json"
 SYMBOLS_KEY = "symbols/spx.parquet"
 
 PIVOTED_PREFIX = "stock/pivoted/"
-TARGET_LOG_RETURNS_PREFIX = "stock/target-log-returns/"
+TARGET_PREFIX = "stock/target/"
 
 LAG_DAYS = int(os.getenv("LAG_DAYS", "5"))
 LAGGED_PREFIX = f"news/lagged-{LAG_DAYS}/"
@@ -201,7 +201,16 @@ def get_target_schema():
         pa = pyarrow()
         fields = [pa.field(LOCAL_DATE, pa.date32())]
         for sym in get_symbols():
-            fields.append(pa.field(f"{sym}_return", pa.float32()))
+            fields.extend(
+                [
+                    pa.field(f"{sym}_log_return_1d", pa.float32()),
+                    pa.field(f"{sym}_log_return_3d", pa.float32()),
+                    pa.field(f"{sym}_log_return_5d", pa.float32()),
+                    pa.field(f"{sym}_zscore_1d", pa.float32()),
+                    pa.field(f"{sym}_rank_1d", pa.float32()),
+                    pa.field(f"{sym}_direction_1d", pa.int8()),
+                ]
+            )
         _target_schema = pa.schema(fields)
     return _target_schema
 

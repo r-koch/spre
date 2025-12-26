@@ -1,5 +1,6 @@
 # --- STANDARD ---
 import os
+from collections import deque
 from datetime import date
 
 # --- PROJECT ---
@@ -36,6 +37,7 @@ MIN_PRICE = 1e-3
 
 RAW_PREFIX = "raw/stock/localDate="
 
+MAX_LOG_RETURN_HORIZON = int(os.getenv("MAX_LOG_RETURN_HORIZON", "5"))
 MIN_REMAINING_MS = int(os.getenv("MIN_REMAINING_MS", "10000"))
 
 LOGGER = s.setup_logger(__file__)
@@ -50,7 +52,7 @@ def get_raw_schema():
         pa = pyarrow()
         _raw_schema = pa.schema(
             {
-                "localDate": pa.date32(),
+                s.LOCAL_DATE: pa.date32(),
                 "id": pa.string(),
                 "close": pa.float64(),
                 "high": pa.float64(),
@@ -138,7 +140,7 @@ def append_pivoted_row(pivoted_columns: dict, py_date: date):
     volume_cols = get_volume_column()
 
     pc = pivoted_columns
-    pc["localDate"].append(py_date)
+    pc[s.LOCAL_DATE].append(py_date)
 
     for i in range(len(symbols)):
         pc[close_cols[i]].append(closes[i])
@@ -166,9 +168,16 @@ def compute_log_returns(prev_closes, curr_closes):
     return out
 
 
-def get_previous_closes(last_processed: date, schema):
+def compute_log_return_horizon(horizon: int, close_history, curr_closes, np):
+    if len(close_history) >= horizon:
+        return compute_log_returns(close_history[-horizon], curr_closes)
+
+    return np.zeros_like(curr_closes, dtype="float32")
+
+
+def get_previous_closes(last_processed: date, schema) -> list:
     if last_processed < s.START_DATE:
-        return None
+        return []
 
     keys = s.list_keys_s3(s.PIVOTED_PREFIX, sort_reversed=True)
     if not keys:
@@ -177,48 +186,79 @@ def get_previous_closes(last_processed: date, schema):
     np = numpy()
     close_cols = get_close_column()
 
+    collected = []
+
+    keys = s.list_keys_s3(s.PIVOTED_PREFIX, sort_reversed=True)
     for key in keys:
-        pivoted_table = s.read_parquet_s3(key, schema)
-        assert pivoted_table is not None
+        table = s.read_parquet_s3(key, schema)
+        dates = table[s.LOCAL_DATE]
 
-        dates = pivoted_table["localDate"]
-
-        # fast path: last row match
-        if dates[-1].as_py() == last_processed:
-            return np.array(
-                [pivoted_table[col][-1].as_py() for col in close_cols],
-                dtype="float32",
-            )
-
-        # reverse chunk-wise scan
         for chunk in reversed(dates.chunks):
             for i in range(len(chunk) - 1, -1, -1):
                 d = chunk[i].as_py()
-
-                if d == last_processed:
-                    return np.array(
-                        [pivoted_table[col][i].as_py() for col in close_cols],
+                if d <= last_processed:
+                    closes = np.array(
+                        [table[col][i].as_py() for col in close_cols],
                         dtype="float32",
                     )
+                    collected.append(closes)
+                    if len(collected) == MAX_LOG_RETURN_HORIZON:
+                        collected.reverse()
+                        return collected
+                elif d < last_processed:
+                    break
 
-                if d < last_processed:
-                    break  # older than target → stop scanning this file
-
-    raise ValueError(f"no pivoted data found for {last_processed}")
+    collected.reverse()
+    return collected
 
 
 def append_target_row(
-    target_columns: dict, previous_closes, curr_closes, py_date: date
+    target_columns,
+    close_history: deque,  # deque of past closes
+    curr_closes,
+    py_date: date,
 ):
-    target_columns["localDate"].append(py_date)
+    np = numpy()
+    symbols = s.get_symbols()
 
-    if previous_closes is None:
-        for sym in s.get_symbols():
-            target_columns[f"{sym}_return"].append(0.0)
+    target_columns[s.LOCAL_DATE].append(py_date)
+
+    # --- 1-day returns ---
+    r1 = compute_log_return_horizon(1, close_history, curr_closes, np)
+
+    # --- 3-day returns ---
+    r3 = compute_log_return_horizon(3, close_history, curr_closes, np)
+
+    # --- 5-day returns ---
+    r5 = compute_log_return_horizon(5, close_history, curr_closes, np)
+
+    # --- cross-sectional stats (1-day only) ---
+    if not r1.any():
+        z = np.zeros_like(r1)
     else:
-        returns = compute_log_returns(previous_closes, curr_closes)
-        for sym, value in zip(s.get_symbols(), returns):
-            target_columns[f"{sym}_return"].append(value)
+        mean = float(r1.mean())
+        std = float(r1.std())
+        z = (r1 - mean) / std if std > 0.0 else np.zeros_like(r1)
+
+    # rank in [0,1], stable
+    order = np.argsort(r1)
+    ranks = np.empty(len(r1), dtype="float32")
+    n = len(r1)
+    if n > 1:
+        ranks[order] = np.arange(n, dtype="float32") / (n - 1)
+    else:
+        ranks[0] = 0.0
+
+    direction = (r1 > 0.0).astype("int8")
+
+    # --- write per-symbol ---
+    for i, sym in enumerate(symbols):
+        target_columns[f"{sym}_log_return_1d"].append(r1[i])
+        target_columns[f"{sym}_log_return_3d"].append(r3[i])
+        target_columns[f"{sym}_log_return_5d"].append(r5[i])
+        target_columns[f"{sym}_zscore_1d"].append(z[i])
+        target_columns[f"{sym}_rank_1d"].append(ranks[i])
+        target_columns[f"{sym}_direction_1d"].append(direction[i])
 
 
 def generate_pivoted_features(context=None):
@@ -246,7 +286,10 @@ def generate_pivoted_features(context=None):
         target_schema = s.get_target_schema()
         target_columns = {field.name: [] for field in target_schema}
 
-        previous_closes = get_previous_closes(last_processed_date, pivoted_schema)
+        close_history = deque(
+            get_previous_closes(last_processed_date, pivoted_schema),
+            maxlen=MAX_LOG_RETURN_HORIZON,
+        )
 
         days_processed = 0
 
@@ -260,10 +303,10 @@ def generate_pivoted_features(context=None):
             curr_closes = append_pivoted_row(pivoted_columns, current_date)
             if curr_closes is not None:
                 append_target_row(
-                    target_columns, previous_closes, curr_closes, current_date
+                    target_columns, close_history, curr_closes, current_date
                 )
+                close_history.append(curr_closes)
 
-                previous_closes = curr_closes
                 days_processed += 1
                 LOGGER.info(f"Computed pivoted + target features for {current_date}")
 
@@ -290,12 +333,12 @@ def generate_pivoted_features(context=None):
         timestamp = s.get_now_timestamp()
 
         pivoted_key = f"{s.PIVOTED_PREFIX}{timestamp}.parquet"
-        target_key = f"{s.TARGET_LOG_RETURNS_PREFIX}{timestamp}.parquet"
+        target_key = f"{s.TARGET_PREFIX}{timestamp}.parquet"
 
         s.write_parquet_s3(pivoted_key, pivoted_table, pivoted_schema)
         s.write_parquet_s3(target_key, target_table, target_schema)
 
-        new_last_processed = pivoted_table["localDate"].to_pylist()[-1]
+        new_last_processed = pivoted_table[s.LOCAL_DATE].to_pylist()[-1]
         s.write_json_date_s3(
             s.STOCK_PREPROC_STATE_KEY, s.LAST_PROCESSED_KEY, new_last_processed
         )
