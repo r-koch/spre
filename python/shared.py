@@ -82,6 +82,8 @@ START_DATE = date.fromisoformat(os.getenv("START_DATE", "1999-11-01"))
 s3 = boto3.client("s3", region_name=AWS_REGION)
 
 # --- SCHEMAS ---
+PIVOTED_FEATURES = ["close", "high", "low", "open", "volume"]
+
 _symbols_schema = None
 
 
@@ -141,18 +143,6 @@ def get_aggregated_schema():
     return _aggregated_schema
 
 
-_aggregated_columns = None
-
-
-def get_aggregated_columns() -> list[str]:
-    global _aggregated_columns
-    if _aggregated_columns is None:
-        _aggregated_columns = [
-            name for name in get_aggregated_schema().names if name != LOCAL_DATE
-        ]
-    return _aggregated_columns
-
-
 _lagged_schema = None
 
 
@@ -161,7 +151,7 @@ def get_lagged_schema():
     if _lagged_schema is None:
         pa = pyarrow()
         fields = [pa.field(LOCAL_DATE, pa.date32())]
-        aggregated_columns = get_aggregated_columns()
+        aggregated_columns = get_aggregated_schema().names[1:]  # excluding LOCAL_DATE
         for lag in range(1, LAG_DAYS + 1):
             for col in aggregated_columns:
                 fields.append(pa.field(f"{col}-{lag}", pa.float32()))
@@ -178,16 +168,11 @@ def get_pivoted_schema():
     if _pivoted_schema is None:
         pa = pyarrow()
         fields = [pa.field(LOCAL_DATE, pa.date32())]
-        for sym in get_symbols():
-            fields.extend(
-                [
-                    pa.field(f"{sym}_close", pa.float32()),
-                    pa.field(f"{sym}_high", pa.float32()),
-                    pa.field(f"{sym}_low", pa.float32()),
-                    pa.field(f"{sym}_open", pa.float32()),
-                    pa.field(f"{sym}_volume", pa.float32()),
-                ]
-            )
+        features = PIVOTED_FEATURES
+        for symbol in get_symbols():
+            for feature in features:
+                fields.append(pa.field(f"{symbol}_{feature}", pa.float32()))
+
         _pivoted_schema = pa.schema(fields)
     return _pivoted_schema
 

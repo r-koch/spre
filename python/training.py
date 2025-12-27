@@ -1,10 +1,12 @@
 # --- STANDARD ---
+import gc
 import json
 import os
-import pickle
 import tempfile
 from datetime import date
-from io import BytesIO
+
+os.environ["TF_DATA_AUTOTUNE"] = "0"
+os.environ["TF_XLA_FLAGS"] = "--tf_xla_enable_xla_devices=false"
 
 # --- PROJECT ---
 import shared as s
@@ -14,21 +16,25 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import tensorflow as tf
-from tensorflow.keras import layers, mixed_precision, Model, Input  # type: ignore
+from tensorflow.keras import layers, losses, models, optimizers  # type: ignore
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau  # type: ignore
-from tensorflow.keras.optimizers import Adam  # type: ignore
-from tensorflow.keras.mixed_precision import LossScaleOptimizer  # type: ignore
 
 # --- CONFIG ---
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "16"))
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1"))
 CONSOLIDATED_COMPRESSION_LEVEL = int(os.getenv("CONSOLIDATED_COMPRESSION_LEVEL", "3"))
 EARLY_STOPPING_PATIENCE = int(os.getenv("EARLY_STOPPING_PATIENCE", "15"))
 EPOCHS = int(os.getenv("EPOCHS", "50"))
+LAMBDA_DIR = float(os.getenv("LAMBDA_DIR", "5.0"))
+LEARNING_RATE = float(os.getenv("LEARNING_RATE", "1e-3"))
+MARGIN = float(os.getenv("MARGIN", "0.01"))
 PARTIAL_FILE_LIMIT = int(os.getenv("PARTIAL_FILE_LIMIT", "1"))
 if PARTIAL_FILE_LIMIT < 1:
     raise ValueError("PARTIAL_FILE_LIMIT must be > 0")
-VAL_DAYS = int(os.getenv("VAL_DAYS", "120"))
-WINDOW = int(os.getenv("WINDOW", "60"))
+SYMBOL_EMBED = int(os.getenv("SYMBOL_EMBED", "64"))
+TARGET_SCALE = float(os.getenv("TARGET_SCALE", "1000.0"))
+WINDOW_SIZE = int(os.getenv("WINDOW_SIZE", "60"))
+
+VAL_DAYS = WINDOW_SIZE * 2
 
 LOGGER = s.setup_logger(__file__)
 
@@ -37,7 +43,7 @@ def deduplicate(table):
     seen = set()
     keep_indices: list[int] = []
 
-    dates = table["localDate"]
+    dates = table[s.LOCAL_DATE]
     for i in range(table.num_rows - 1, -1, -1):
         d = dates[i].as_py()
         if d not in seen:
@@ -77,15 +83,15 @@ def get_data_frame(prefix: str, schema):
     consolidate(keys, table, prefix, schema)
 
     df = table.to_pandas()
-    df["localDate"] = pd.to_datetime(df["localDate"])
-    df = df.set_index("localDate").sort_index()
+    df[s.LOCAL_DATE] = pd.to_datetime(df[s.LOCAL_DATE])
+    df = df.set_index(s.LOCAL_DATE).sort_index()
     return df
 
 
-def get_training_inputs():
+def get_training_data():
     stock_data = get_data_frame(s.PIVOTED_PREFIX, s.get_pivoted_schema())
     news_data = get_data_frame(s.LAGGED_PREFIX, s.get_lagged_schema())
-    target_data = get_data_frame(s.TARGET_LOG_RETURNS_PREFIX, s.get_target_schema())
+    target_data = get_data_frame(s.TARGET_PREFIX, s.get_target_schema())
 
     common_index = stock_data.index.intersection(news_data.index).intersection(
         target_data.index
@@ -107,85 +113,205 @@ def get_training_inputs():
     return stock_data, news_data, target_data
 
 
-def get_training_and_validation_mask(index: pd.DatetimeIndex, cutoff_date: date):
-    cutoff = pd.Timestamp(cutoff_date)
+def build_windows(stock_data, news_data, target_data):
+    symbols = s.get_symbols()
+    symbol_count = len(symbols)
+    window = WINDOW_SIZE
 
-    val_end = cutoff
-    val_start = cutoff - pd.Timedelta(days=VAL_DAYS - 1)
+    # ---- STOCK FEATURES ----
+    stock_cols = s.get_pivoted_schema().names[1:]  # excluding LOCAL_DATE
 
-    training_mask = index < val_start
-    validation_mask = (index >= val_start) & (index <= val_end)
+    per_symbol_features = len(stock_cols) // symbol_count
+    assert per_symbol_features * symbol_count == len(stock_cols)
 
-    if not training_mask.any():
-        raise ValueError("Empty training split")
-    if not validation_mask.any():
-        raise ValueError("Empty validation split")
+    # (time, symbols * features)
+    stock_matrix = stock_data[stock_cols].to_numpy(dtype="float32")
 
-    return training_mask, validation_mask
-
-
-def windowed_dataset(
-    X: np.ndarray,
-    Y: np.ndarray,
-    shuffle: bool,
-):
-    X_ds = tf.data.Dataset.from_tensor_slices(X)
-    Y_ds = tf.data.Dataset.from_tensor_slices(Y)
-
-    # Sliding windows over X
-    X_win = X_ds.window(WINDOW, shift=1, drop_remainder=True).flat_map(
-        lambda w: w.batch(WINDOW)
+    # (time, symbols, features)
+    stock_matrix = stock_matrix.reshape(
+        len(stock_data),
+        symbol_count,
+        per_symbol_features,
     )
 
-    # Targets aligned to window end: Y[i] for X[i-window:i]
-    Y_win = Y_ds.skip(WINDOW)
+    # ---- NEWS ----
+    news_matrix = news_data.to_numpy(dtype="float32")
 
-    ds = tf.data.Dataset.zip((X_win, Y_win))
+    # ---- TARGETS ----
+    z_cols = [f"{sym}_zscore_1d" for sym in symbols]
+    rank_cols = [f"{sym}_rank_1d" for sym in symbols]
+    dir_cols = [f"{sym}_direction_1d" for sym in symbols]
+    lr1_cols = [f"{sym}_log_return_1d" for sym in symbols]
+    lr3_cols = [f"{sym}_log_return_3d" for sym in symbols]
+    lr5_cols = [f"{sym}_log_return_5d" for sym in symbols]
 
-    if shuffle:
-        ds = ds.shuffle(1024)
+    Y_z_all = target_data[z_cols].to_numpy("float32")
+    Y_rank_all = target_data[rank_cols].to_numpy("float32")
+    Y_dir_all = target_data[dir_cols].to_numpy("float32")
+    Y_lr1_all = target_data[lr1_cols].to_numpy("float32")
+    Y_lr3_all = target_data[lr3_cols].to_numpy("float32")
+    Y_lr5_all = target_data[lr5_cols].to_numpy("float32")
 
-    return ds.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+    # ---- WINDOWING ----
+    num_samples = len(stock_data) - window
 
-
-def build_model(D: int, out_dim: int) -> Model:
-    inp = Input((WINDOW, D))
-
-    x = layers.Conv1D(filters=128, kernel_size=5, padding="causal", activation="relu")(
-        inp
+    X_stock = np.empty(
+        (num_samples, window, symbol_count, per_symbol_features),
+        dtype="float32",
+    )
+    X_news = np.empty(
+        (num_samples, window, news_matrix.shape[1]),
+        dtype="float32",
     )
 
-    x = layers.Conv1D(filters=128, kernel_size=5, padding="causal", activation="relu")(
-        x
+    Y_z = Y_z_all[window:]
+    Y_rank = Y_rank_all[window:]
+    Y_dir = Y_dir_all[window:]
+    Y_lr1 = Y_lr1_all[window:]
+    Y_lr3 = Y_lr3_all[window:]
+    Y_lr5 = Y_lr5_all[window:]
+
+    for i in range(num_samples):
+        t = i + window
+        X_stock[i] = stock_matrix[t - window : t]
+        X_news[i] = news_matrix[t - window : t]
+
+    return (
+        X_stock,
+        X_news,
+        Y_z,
+        Y_rank,
+        Y_dir,
+        Y_lr1,
+        Y_lr3,
+        Y_lr5,
     )
 
-    # --- long-range dependencies ---
-    x = layers.Bidirectional(
-        layers.LSTM(256, return_sequences=True, dropout=0.2, recurrent_dropout=0.0)
+
+class SymbolAttention(layers.Layer):
+    def __init__(self, num_heads=4, key_dim=32, **kwargs):
+        super().__init__(**kwargs)
+        self.mha = layers.MultiHeadAttention(num_heads=num_heads, key_dim=key_dim)
+
+    def call(self, x):
+        # x: (batch, time, symbols, features)
+        b, t, s, f = tf.unstack(tf.shape(x))  # type: ignore
+
+        x = tf.reshape(x, (b * t, s, f))
+        x = self.mha(x, x)
+        x = tf.reshape(x, (b, t, s, f))
+        return x
+
+    def compute_output_shape(self, input_shape):
+        return input_shape
+
+    def get_config(self):
+        config = super().get_config()
+        config.update(
+            {
+                "num_heads": self.mha.num_heads,
+                "key_dim": self.mha.key_dim,
+            }
+        )
+        return config
+
+
+def build_model(time_steps, stock_feature_dim, news_feature_dim, symbol_count):
+
+    stock_in = layers.Input(
+        shape=(time_steps, symbol_count, stock_feature_dim), name="stock"
+    )
+    news_in = layers.Input(shape=(time_steps, news_feature_dim), name="news")
+
+    # --- project per-symbol features ---
+    x = layers.TimeDistributed(
+        layers.TimeDistributed(layers.Dense(SYMBOL_EMBED, activation="relu"))
+    )(stock_in)
+    # (batch, time, symbols, SYMBOL_EMBED)
+
+    # --- symbol attention (same day) ---
+    x = SymbolAttention(num_heads=4, key_dim=SYMBOL_EMBED // 4)(x)
+    # x shape here: (batch, symbols, time, embed)
+
+    # --- reduce symbols ---
+    x = layers.Lambda(
+        lambda t: tf.reduce_mean(t, axis=2),
+        name="pool_symbols",
     )(x)
+    # shape: (batch, symbols, embed)
 
-    x = layers.Bidirectional(
-        layers.LSTM(128, return_sequences=False, dropout=0.2, recurrent_dropout=0.0)
+    # --- cross-symbol mixing ---
+    x = layers.MultiHeadAttention(
+        num_heads=4,
+        key_dim=SYMBOL_EMBED // 4,
+    )(x, x)
+
+    # --- reduce time ---
+    x = layers.Lambda(
+        lambda t: tf.reduce_mean(t, axis=1),
+        name="pool_time",
     )(x)
+    # shape: (batch, embed)
 
-    # --- cross-asset interaction ---
-    x = layers.Dense(1024, activation="relu")(x)
-    x = layers.Dense(512, activation="relu")(x)
+    # --- news encoder ---
+    y = layers.MultiHeadAttention(num_heads=4, key_dim=16)(news_in, news_in)
+    y = layers.GlobalAveragePooling1D()(y)
 
-    out = layers.Dense(out_dim, activation="linear", dtype="float32")(x)
+    # --- fuse ---
+    x = layers.Concatenate()([x, y])
 
-    model = Model(inp, out)
+    # --- shared trunk ---
+    shared = layers.Dense(256, activation="relu")(x)
+    shared = layers.Dense(128, activation="relu")(shared)
 
-    base_opt = Adam(learning_rate=3e-4)
-    opt = LossScaleOptimizer(base_opt)
+    # --- heads ---
+    def head(name, activation=None):
+        return layers.Dense(symbol_count, activation=activation, name=name)(shared)
 
-    model.compile(optimizer=opt, loss="mse", metrics=["mae"])
+    model = models.Model(
+        inputs=[stock_in, news_in],
+        outputs=[
+            head("zscore_1d"),
+            head("rank_1d"),
+            head("direction_1d", activation="sigmoid"),
+            head("log_return_1d"),
+            head("log_return_3d"),
+            head("log_return_5d"),
+        ],
+    )
+
+    model.compile(
+        optimizer=optimizers.Adam(LEARNING_RATE),
+        loss={
+            "zscore_1d": "mse",
+            "rank_1d": losses.Huber(delta=0.1),
+            "direction_1d": "binary_crossentropy",
+            "log_return_1d": "mse",
+            "log_return_3d": "mse",
+            "log_return_5d": "mse",
+        },
+        loss_weights={
+            "zscore_1d": 1.0,
+            "rank_1d": 0.3,
+            "direction_1d": 0.3,
+            "log_return_1d": 0.05,
+            "log_return_3d": 0.05,
+            "log_return_5d": 0.05,
+        },
+    )
+
     return model
 
 
-def assert_finite(name, arr):
-    if not np.isfinite(arr).all():
-        raise ValueError(f"{name} contains NaN or Inf")
+def write_model_s3(model, model_key):
+    with tempfile.TemporaryDirectory() as tmp:
+        local_model_path = os.path.join(tmp, s.MODEL_FILE_NAME)
+        model.save(local_model_path)
+
+        with open(local_model_path, "rb") as f:
+            model_data = f.read()
+
+        s.write_bytes_s3(model_key, model_data)
 
 
 def train():
@@ -194,124 +320,119 @@ def train():
         for gpu in gpus:
             tf.config.experimental.set_memory_growth(gpu, True)
 
-        mixed_precision.set_global_policy("mixed_float16")
+        tf.config.optimizer.set_jit(False)
+        tf.config.threading.set_intra_op_parallelism_threads(2)
+        tf.config.threading.set_inter_op_parallelism_threads(2)
 
-        stock_data, news_data, target_data = get_training_inputs()
+        stock_data, news_data, target_data = get_training_data()
+        LOGGER.debug("get_training_data")
+        (
+            X_stock,
+            X_news,
+            Y_z,
+            Y_rank,
+            Y_dir,
+            Y_lr_1d,
+            Y_lr_3d,
+            Y_lr_5d,
+        ) = build_windows(
+            stock_data,
+            news_data,
+            target_data,
+        )
+        LOGGER.debug("build_windows")
 
-        cutoff_date = s.get_last_processed_date()
+        Y_lr_1d *= TARGET_SCALE
+        Y_lr_3d *= TARGET_SCALE
+        Y_lr_5d *= TARGET_SCALE
 
-        train_mask, val_mask = get_training_and_validation_mask(
-            stock_data.index, cutoff_date
+        Y_lr_1d = np.clip(Y_lr_1d, -10 * TARGET_SCALE, 10 * TARGET_SCALE)
+        Y_lr_3d = np.clip(Y_lr_3d, -10 * TARGET_SCALE, 10 * TARGET_SCALE)
+        Y_lr_5d = np.clip(Y_lr_5d, -10 * TARGET_SCALE, 10 * TARGET_SCALE)
+
+        assert X_stock.shape[2] == len(s.get_symbols())
+
+        symbol_count = Y_z.shape[1]
+        time_steps = X_stock.shape[1]
+        stock_feature_dim = X_stock.shape[3]
+        news_feature_dim = X_news.shape[2]
+
+        model = build_model(
+            time_steps,
+            stock_feature_dim,
+            news_feature_dim,
+            symbol_count,
         )
 
-        X_stock_train = stock_data.loc[train_mask].values
-        X_stock_val = stock_data.loc[val_mask].values
+        LOGGER.info(model.summary())
 
-        X_news_train = news_data.loc[train_mask].values
-        X_news_val = news_data.loc[val_mask].values
+        split = int(0.8 * len(X_stock))
 
-        X_train = np.hstack([X_stock_train, X_news_train])
-        X_val = np.hstack([X_stock_val, X_news_val])
-
-        mean = X_train.mean(axis=0, keepdims=True)
-        std = X_train.std(axis=0, keepdims=True) + 1e-6
-
-        X_train = (X_train - mean) / std
-        X_val = (X_val - mean) / std
-
-        Y_train = target_data.loc[train_mask].values
-        Y_val = target_data.loc[val_mask].values
-
-        assert_finite("X_train", X_train)
-        assert_finite("Y_train", Y_train)
-        assert_finite("X_val", X_val)
-        assert_finite("Y_val", Y_val)
-
-        stock_feature_count = X_stock_train.shape[1]
-        news_feature_count = X_news_train.shape[1]
-        total_feature_count = stock_feature_count + news_feature_count
-
-        assert X_train.shape[1] == total_feature_count
-
-        LOGGER.info(f"Training windows shape: {X_train.shape}")
-
-        train_ds = windowed_dataset(X_train, Y_train, shuffle=True).repeat()
-
-        val_ds = windowed_dataset(X_val, Y_val, shuffle=False)
-
-        num_train_windows = len(X_train) - WINDOW
-        steps_per_epoch = num_train_windows // BATCH_SIZE
-
-        num_val_windows = len(X_val) - WINDOW
-        validation_steps = max(1, num_val_windows // BATCH_SIZE)
-
-        model = build_model(X_train.shape[1], Y_train.shape[1])
+        # keep only what fit needs
+        del stock_data, news_data, target_data
+        gc.collect()
 
         model.fit(
-            train_ds,
-            validation_data=val_ds,
+            x={"stock": X_stock[:split], "news": X_news[:split]},
+            y={
+                "zscore_1d": Y_z[:split],
+                "rank_1d": Y_rank[:split],
+                "direction_1d": Y_dir[:split],
+                "log_return_1d": Y_lr_1d[:split],
+                "log_return_3d": Y_lr_3d[:split],
+                "log_return_5d": Y_lr_5d[:split],
+            },
+            validation_data=(
+                {"stock": X_stock[split:], "news": X_news[split:]},
+                {
+                    "zscore_1d": Y_z[split:],
+                    "rank_1d": Y_rank[split:],
+                    "direction_1d": Y_dir[split:],
+                    "log_return_1d": Y_lr_1d[split:],
+                    "log_return_3d": Y_lr_3d[split:],
+                    "log_return_5d": Y_lr_5d[split:],
+                },
+            ),
             epochs=EPOCHS,
-            steps_per_epoch=steps_per_epoch,
-            validation_steps=validation_steps,
+            batch_size=BATCH_SIZE,
+            validation_split=0.0,
+            shuffle=True,
             callbacks=[
                 EarlyStopping(
+                    monitor="val_loss",
                     patience=EARLY_STOPPING_PATIENCE,
                     restore_best_weights=True,
-                    monitor="val_loss",
                 ),
-                ReduceLROnPlateau(patience=3, factor=0.5, monitor="val_loss"),
+                ReduceLROnPlateau(
+                    monitor="val_loss",
+                    factor=0.5,
+                    patience=5,
+                    min_lr=1e-5,
+                ),
             ],
         )
 
-        model_date = cutoff_date.isoformat()
-        base_prefix = f"{s.MODEL_PREFIX}{model_date}/"
+        # --- persist ---
+        training_date = date.today().isoformat()
+        model_key = f"{s.MODEL_PREFIX}{training_date}/{s.MODEL_FILE_NAME}"
+        meta_key = f"{s.MODEL_PREFIX}{training_date}/{s.META_FILE_NAME}"
 
-        with tempfile.TemporaryDirectory() as tmp:
-            local_model_path = os.path.join(tmp, s.MODEL_FILE_NAME)
-            model.save(local_model_path)
+        write_model_s3(model, model_key)
 
-            with open(local_model_path, "rb") as f:
-                model_data = f.read()
-
-            model_key = f"{base_prefix}{s.MODEL_FILE_NAME}"
-            s.write_bytes_s3(model_key, model_data)
-
-        if mean.shape[1] != total_feature_count:
-            raise ValueError(
-                "Normalization vector length does not match feature layout"
-            )
-
-        meta = {
-            "trainingCutoff": model_date,
-            "trainingRange": [
-                str(stock_data.index[train_mask].min()),
-                str(stock_data.index[train_mask].max()),
-            ],
-            "validationRange": [
-                str(stock_data.index[val_mask].min()),
-                str(stock_data.index[val_mask].max()),
-            ],
-            "windowSize": WINDOW,
-            "features": {
-                "stock": stock_data.shape[1],
-                "news": news_data.shape[1],
-            },
-            "normalization": {
-                "mean": mean.astype("float32").tolist(),
-                "std": std.astype("float32").tolist(),
-                "stockFeatureCount": int(stock_feature_count),
-                "newsFeatureCount": int(news_feature_count),
-                "totalFeatureCount": int(total_feature_count),
-            },
+        meta_out = {
+            "windowSize": time_steps,
+            "symbolCount": symbol_count,
+            "trainingCutoff": training_date,
         }
-        meta_data = json.dumps(meta, indent=2).encode("utf-8")
+        s.write_bytes_s3(meta_key, json.dumps(meta_out).encode("utf-8"))
 
-        meta_key = f"{base_prefix}{s.META_FILE_NAME}"
-        s.write_bytes_s3(meta_key, meta_data)
+        s.write_json_date_s3(
+            s.TRAINING_STATE_KEY,
+            s.LAST_TRAINED_KEY,
+            date.fromisoformat(training_date),
+        )
 
-        s.write_json_date_s3(s.TRAINING_STATE_KEY, s.LAST_TRAINED_KEY, cutoff_date)
-
-        LOGGER.info("finished training")
+        return s.result(LOGGER, 200, "training finished")
 
     except Exception:
         LOGGER.exception("Error in train")
