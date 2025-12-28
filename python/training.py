@@ -45,6 +45,21 @@ REDUCE_LR_ON_PLATEAU_MIN_LR = float(os.getenv("REDUCE_LR_ON_PLATEAU_MIN_LR", "1e
 LOGGER = s.setup_logger(__file__)
 
 
+class MeanOverSymbols(layers.Layer):
+    # Reduces (batch, time, symbols, embed) -> (batch, time, embed)
+    # by averaging over the symbol axis.
+
+    def call(self, inputs):
+        return tf.reduce_mean(inputs, axis=2)
+
+    def compute_output_shape(self, input_shape):
+        # input_shape: (batch, time, symbols, embed)
+        return (input_shape[0], input_shape[1], input_shape[3])
+
+    def get_config(self):
+        return super().get_config()
+
+
 def deduplicate(table):
     seen = set()
     keep_indices: list[int] = []
@@ -163,7 +178,6 @@ def build_training_dataset(stock_table, news_table, target_table):
     lr5_arrays = target_cols(lr5_cols)
 
     day_count = stock_table.num_rows
-    num_samples = day_count - window
 
     def gen():
         for t in range(window, day_count):
@@ -215,7 +229,7 @@ def build_training_dataset(stock_table, news_table, target_table):
     ds = tf.data.Dataset.from_generator(gen, output_signature=output_signature)
     ds = ds.batch(BATCH_SIZE, drop_remainder=True).prefetch(1)
 
-    return ds, num_samples, stock_feature_count, news_feature_count, symbol_count
+    return ds, stock_feature_count, news_feature_count, symbol_count
 
 
 def build_model(time_steps, stock_feature_dim, news_feature_dim, symbol_count):
@@ -231,11 +245,9 @@ def build_model(time_steps, stock_feature_dim, news_feature_dim, symbol_count):
     )(stock_in)
     # (batch, time, symbols, embed)
 
-    # --- EARLY symbol pooling (critical) ---
-    x = layers.Lambda(
-        lambda t: tf.reduce_mean(t, axis=2),
-        name="pool_symbols_early",
-    )(x)
+    # --- pool symbols ---
+    x = MeanOverSymbols(name="pool_symbols")(x)
+
     # (batch, time, embed)
 
     # --- temporal attention only ---
@@ -392,15 +404,12 @@ def train():
 
         (
             train_ds,
-            train_samples,
             stock_feature_count,
             news_feature_count,
             symbol_count,
         ) = build_training_dataset(stock_train, news_train, target_train)
 
-        val_ds, val_samples, _, _, _ = build_training_dataset(
-            stock_val, news_val, target_val
-        )
+        val_ds, _, _, _ = build_training_dataset(stock_val, news_val, target_val)
 
         train_ds = train_ds.map(scale_targets, num_parallel_calls=1)
         val_ds = val_ds.map(scale_targets, num_parallel_calls=1)
