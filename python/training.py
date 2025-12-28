@@ -31,8 +31,6 @@ STOCK_EMBED = int(os.getenv("SYMBOL_EMBED", "8"))
 NEWS_ATTENTION_HEADS = int(os.getenv("NEWS_ATTENTION_HEADS", "1"))
 NEWS_EMBED = int(os.getenv("NEWS_EMBED", "8"))
 
-TARGET_SCALE = float(os.getenv("TARGET_SCALE", "1000.0"))
-
 VALIDATION_MAX_RATIO = float(os.getenv("VALIDATION_MAX_RATIO", "0.2"))
 
 LEARNING_RATE = float(os.getenv("LEARNING_RATE", "1e-3"))
@@ -141,21 +139,46 @@ def build_training_dataset(stock_table, news_table, target_table):
     lr3_cols = [f"{s}_log_return_3d" for s in symbols]
     lr5_cols = [f"{s}_log_return_5d" for s in symbols]
 
+    stock_columns = [
+        stock_table.column(col).combine_chunks().to_numpy(zero_copy_only=False)
+        for col in s.get_pivoted_schema().names[1:]
+    ]
+
+    news_columns = [
+        news_table.column(col).combine_chunks().to_numpy(zero_copy_only=False)
+        for col in s.get_lagged_schema().names[1:]
+    ]
+
+    def target_cols(cols):
+        return [
+            target_table.column(c).combine_chunks().to_numpy(zero_copy_only=False)
+            for c in cols
+        ]
+
+    z_arrays = target_cols(z_cols)
+    rank_arrays = target_cols(rank_cols)
+    dir_arrays = target_cols(dir_cols)
+    lr1_arrays = target_cols(lr1_cols)
+    lr3_arrays = target_cols(lr3_cols)
+    lr5_arrays = target_cols(lr5_cols)
+
     day_count = stock_table.num_rows
     num_samples = day_count - window
 
     def gen():
         for t in range(window, day_count):
-            stock_window = table_to_numpy(
-                stock_table.slice(t - window, window).drop([s.LOCAL_DATE])
+            stock_window = np.stack(
+                [col[t - window : t] for col in stock_columns],
+                axis=1,
             ).reshape(window, symbol_count, stock_feature_count)
 
-            news_window = table_to_numpy(
-                news_table.slice(t - window, window).drop([s.LOCAL_DATE])
+            news_window = np.stack(
+                [col[t - window : t] for col in news_columns],
+                axis=1,
             )
 
-            def take(cols):
-                return table_to_numpy(target_table.slice(t, 1).select(cols))[0]
+            def take(arrs):
+                return np.array([a[t] for a in arrs], dtype="float32")
 
             yield (
                 {
@@ -163,12 +186,12 @@ def build_training_dataset(stock_table, news_table, target_table):
                     "news": news_window,
                 },
                 {
-                    "zscore_1d": take(z_cols),
-                    "rank_1d": take(rank_cols),
-                    "direction_1d": take(dir_cols),
-                    "log_return_1d": take(lr1_cols),
-                    "log_return_3d": take(lr3_cols),
-                    "log_return_5d": take(lr5_cols),
+                    "zscore_1d": take(z_arrays),
+                    "rank_1d": take(rank_arrays),
+                    "direction_1d": take(dir_arrays),
+                    "log_return_1d": take(lr1_arrays),
+                    "log_return_3d": take(lr3_arrays),
+                    "log_return_5d": take(lr5_arrays),
                 },
             )
 
@@ -298,11 +321,13 @@ def write_model_s3(model, model_key):
 def scale_targets(x, y):
     y = dict(y)  # defensive copy
 
-    y["log_return_1d"] *= TARGET_SCALE
-    y["log_return_3d"] *= TARGET_SCALE
-    y["log_return_5d"] *= TARGET_SCALE
+    target_scale = s.TARGET_SCALE
 
-    clip = 10.0 * TARGET_SCALE
+    y["log_return_1d"] *= target_scale
+    y["log_return_3d"] *= target_scale
+    y["log_return_5d"] *= target_scale
+
+    clip = 10.0 * target_scale
     y["log_return_1d"] = tf.clip_by_value(y["log_return_1d"], -clip, clip)
     y["log_return_3d"] = tf.clip_by_value(y["log_return_3d"], -clip, clip)
     y["log_return_5d"] = tf.clip_by_value(y["log_return_5d"], -clip, clip)
