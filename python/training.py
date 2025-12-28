@@ -12,11 +12,10 @@ os.environ["TF_XLA_FLAGS"] = "--tf_xla_enable_xla_devices=false"
 import shared as s
 
 # --- THIRD-PARTY ---
-import numpy as np
 import pandas as pd
 import pyarrow as pa
 import tensorflow as tf
-from tensorflow.keras import layers, losses, models, optimizers  # type: ignore
+from tensorflow.keras import layers, losses, mixed_precision, models, optimizers  # type: ignore
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau  # type: ignore
 
 # --- CONFIG ---
@@ -27,14 +26,16 @@ EPOCHS = int(os.getenv("EPOCHS", "50"))
 LAMBDA_DIR = float(os.getenv("LAMBDA_DIR", "5.0"))
 LEARNING_RATE = float(os.getenv("LEARNING_RATE", "1e-3"))
 MARGIN = float(os.getenv("MARGIN", "0.01"))
+NEWS_ATTENTION_HEADS = int(os.getenv("NEWS_ATTENTION_HEADS", "1"))
+NEWS_EMBED = int(os.getenv("NEWS_EMBED", "8"))
 PARTIAL_FILE_LIMIT = int(os.getenv("PARTIAL_FILE_LIMIT", "1"))
 if PARTIAL_FILE_LIMIT < 1:
     raise ValueError("PARTIAL_FILE_LIMIT must be > 0")
-SYMBOL_EMBED = int(os.getenv("SYMBOL_EMBED", "64"))
+SYMBOL_ATTENTION_HEADS = int(os.getenv("SYMBOL_ATTENTION_HEADS", "1"))
+SYMBOL_EMBED = int(os.getenv("SYMBOL_EMBED", "8"))
 TARGET_SCALE = float(os.getenv("TARGET_SCALE", "1000.0"))
-WINDOW_SIZE = int(os.getenv("WINDOW_SIZE", "60"))
-
-VAL_DAYS = WINDOW_SIZE * 2
+VALIDATION_MAX_RATIO = float(os.getenv("VALIDATION_MAX_RATIO", "0.2"))
+WINDOW_SIZE = int(os.getenv("WINDOW_SIZE", "30"))
 
 LOGGER = s.setup_logger(__file__)
 
@@ -113,31 +114,21 @@ def get_training_data():
     return stock_data, news_data, target_data
 
 
-def build_windows(stock_data, news_data, target_data):
+def build_training_dataset(
+    stock_data: pd.DataFrame, news_data: pd.DataFrame, target_data: pd.DataFrame
+):
     symbols = s.get_symbols()
     symbol_count = len(symbols)
     window = WINDOW_SIZE
 
-    # ---- STOCK FEATURES ----
-    stock_cols = s.get_pivoted_schema().names[1:]  # excluding LOCAL_DATE
+    # ---------- SETUP ----------
+    stock_cols = s.get_pivoted_schema().names[1:]
 
-    per_symbol_features = len(stock_cols) // symbol_count
-    assert per_symbol_features * symbol_count == len(stock_cols)
+    stock_feature_count = len(s.PIVOTED_FEATURES)
+    assert stock_feature_count * symbol_count == len(stock_cols)
 
-    # (time, symbols * features)
-    stock_matrix = stock_data[stock_cols].to_numpy(dtype="float32")
+    news_feature_count = news_data.shape[1]
 
-    # (time, symbols, features)
-    stock_matrix = stock_matrix.reshape(
-        len(stock_data),
-        symbol_count,
-        per_symbol_features,
-    )
-
-    # ---- NEWS ----
-    news_matrix = news_data.to_numpy(dtype="float32")
-
-    # ---- TARGETS ----
     z_cols = [f"{sym}_zscore_1d" for sym in symbols]
     rank_cols = [f"{sym}_rank_1d" for sym in symbols]
     dir_cols = [f"{sym}_direction_1d" for sym in symbols]
@@ -145,75 +136,63 @@ def build_windows(stock_data, news_data, target_data):
     lr3_cols = [f"{sym}_log_return_3d" for sym in symbols]
     lr5_cols = [f"{sym}_log_return_5d" for sym in symbols]
 
-    Y_z_all = target_data[z_cols].to_numpy("float32")
-    Y_rank_all = target_data[rank_cols].to_numpy("float32")
-    Y_dir_all = target_data[dir_cols].to_numpy("float32")
-    Y_lr1_all = target_data[lr1_cols].to_numpy("float32")
-    Y_lr3_all = target_data[lr3_cols].to_numpy("float32")
-    Y_lr5_all = target_data[lr5_cols].to_numpy("float32")
-
-    # ---- WINDOWING ----
     num_samples = len(stock_data) - window
 
-    X_stock = np.empty(
-        (num_samples, window, symbol_count, per_symbol_features),
-        dtype="float32",
+    # ---- PRE-MATERIALIZE ONCE ----
+    stock_values = stock_data[stock_cols].to_numpy(dtype="float32")
+    news_values = news_data.to_numpy(dtype="float32")
+
+    z_values = target_data[z_cols].to_numpy(dtype="float32")
+    rank_values = target_data[rank_cols].to_numpy(dtype="float32")
+    dir_values = target_data[dir_cols].to_numpy(dtype="float32")
+    lr1_values = target_data[lr1_cols].to_numpy(dtype="float32")
+    lr3_values = target_data[lr3_cols].to_numpy(dtype="float32")
+    lr5_values = target_data[lr5_cols].to_numpy(dtype="float32")
+
+    def generator():
+        for t in range(window, len(stock_values)):
+            yield (
+                {
+                    "stock": stock_values[t - window : t].reshape(
+                        window, symbol_count, stock_feature_count
+                    ),
+                    "news": news_values[t - window : t],
+                },
+                {
+                    "zscore_1d": z_values[t],
+                    "rank_1d": rank_values[t],
+                    "direction_1d": dir_values[t],
+                    "log_return_1d": lr1_values[t],
+                    "log_return_3d": lr3_values[t],
+                    "log_return_5d": lr5_values[t],
+                },
+            )
+
+    # ---------- TF.DATASET ----------
+    output_signature = (
+        {
+            "stock": tf.TensorSpec(
+                shape=(window, symbol_count, stock_feature_count), dtype=tf.float32  # type: ignore
+            ),
+            "news": tf.TensorSpec(
+                shape=(window, news_feature_count), dtype=tf.float32  # type: ignore
+            ),
+        },
+        {
+            "zscore_1d": tf.TensorSpec(shape=(symbol_count,), dtype=tf.float32),  # type: ignore
+            "rank_1d": tf.TensorSpec(shape=(symbol_count,), dtype=tf.float32),  # type: ignore
+            "direction_1d": tf.TensorSpec(shape=(symbol_count,), dtype=tf.float32),  # type: ignore
+            "log_return_1d": tf.TensorSpec(shape=(symbol_count,), dtype=tf.float32),  # type: ignore
+            "log_return_3d": tf.TensorSpec(shape=(symbol_count,), dtype=tf.float32),  # type: ignore
+            "log_return_5d": tf.TensorSpec(shape=(symbol_count,), dtype=tf.float32),  # type: ignore
+        },
     )
-    X_news = np.empty(
-        (num_samples, window, news_matrix.shape[1]),
-        dtype="float32",
-    )
 
-    Y_z = Y_z_all[window:]
-    Y_rank = Y_rank_all[window:]
-    Y_dir = Y_dir_all[window:]
-    Y_lr1 = Y_lr1_all[window:]
-    Y_lr3 = Y_lr3_all[window:]
-    Y_lr5 = Y_lr5_all[window:]
+    ds = tf.data.Dataset.from_generator(generator, output_signature=output_signature)
 
-    for i in range(num_samples):
-        t = i + window
-        X_stock[i] = stock_matrix[t - window : t]
-        X_news[i] = news_matrix[t - window : t]
+    ds = ds.batch(BATCH_SIZE, drop_remainder=True).prefetch(1)  # critical: bounded RAM
 
-    return (
-        X_stock,
-        X_news,
-        Y_z,
-        Y_rank,
-        Y_dir,
-        Y_lr1,
-        Y_lr3,
-        Y_lr5,
-    )
-
-
-class SymbolAttention(layers.Layer):
-    def __init__(self, num_heads=4, key_dim=32, **kwargs):
-        super().__init__(**kwargs)
-        self.mha = layers.MultiHeadAttention(num_heads=num_heads, key_dim=key_dim)
-
-    def call(self, x):
-        # x: (batch, time, symbols, features)
-        b, t, s, f = tf.unstack(tf.shape(x))  # type: ignore
-
-        x = tf.reshape(x, (b * t, s, f))
-        x = self.mha(x, x)
-        x = tf.reshape(x, (b, t, s, f))
-        return x
-
-    def compute_output_shape(self, input_shape):
-        return input_shape
-
-    def get_config(self):
-        config = super().get_config()
-        config.update(
-            {
-                "num_heads": self.mha.num_heads,
-                "key_dim": self.mha.key_dim,
-            }
-        )
-        return config
+    return ds, num_samples, stock_feature_count
 
 
 def build_model(time_steps, stock_feature_dim, news_feature_dim, symbol_count):
@@ -223,38 +202,35 @@ def build_model(time_steps, stock_feature_dim, news_feature_dim, symbol_count):
     )
     news_in = layers.Input(shape=(time_steps, news_feature_dim), name="news")
 
-    # --- project per-symbol features ---
+    # --- per-symbol projection ---
     x = layers.TimeDistributed(
         layers.TimeDistributed(layers.Dense(SYMBOL_EMBED, activation="relu"))
     )(stock_in)
-    # (batch, time, symbols, SYMBOL_EMBED)
+    # (batch, time, symbols, embed)
 
-    # --- symbol attention (same day) ---
-    x = SymbolAttention(num_heads=4, key_dim=SYMBOL_EMBED // 4)(x)
-    # x shape here: (batch, symbols, time, embed)
-
-    # --- reduce symbols ---
+    # --- EARLY symbol pooling (critical) ---
     x = layers.Lambda(
         lambda t: tf.reduce_mean(t, axis=2),
-        name="pool_symbols",
+        name="pool_symbols_early",
     )(x)
-    # shape: (batch, symbols, embed)
+    # (batch, time, embed)
 
-    # --- cross-symbol mixing ---
+    # --- temporal attention only ---
     x = layers.MultiHeadAttention(
-        num_heads=4,
-        key_dim=SYMBOL_EMBED // 4,
+        num_heads=SYMBOL_ATTENTION_HEADS,
+        key_dim=SYMBOL_EMBED // SYMBOL_ATTENTION_HEADS,
     )(x, x)
+    # (batch, time, embed)
 
-    # --- reduce time ---
-    x = layers.Lambda(
-        lambda t: tf.reduce_mean(t, axis=1),
-        name="pool_time",
-    )(x)
-    # shape: (batch, embed)
+    # --- pool time ---
+    x = layers.GlobalAveragePooling1D()(x)
+    # (batch, embed)
 
     # --- news encoder ---
-    y = layers.MultiHeadAttention(num_heads=4, key_dim=16)(news_in, news_in)
+    y = layers.MultiHeadAttention(
+        num_heads=NEWS_ATTENTION_HEADS,
+        key_dim=NEWS_EMBED,
+    )(news_in, news_in)
     y = layers.GlobalAveragePooling1D()(y)
 
     # --- fuse ---
@@ -266,7 +242,12 @@ def build_model(time_steps, stock_feature_dim, news_feature_dim, symbol_count):
 
     # --- heads ---
     def head(name, activation=None):
-        return layers.Dense(symbol_count, activation=activation, name=name)(shared)
+        return layers.Dense(
+            symbol_count,
+            activation=activation,
+            name=name,
+            dtype="float32",
+        )(shared)
 
     model = models.Model(
         inputs=[stock_in, news_in],
@@ -314,89 +295,136 @@ def write_model_s3(model, model_key):
         s.write_bytes_s3(model_key, model_data)
 
 
+def scale_targets(x, y):
+    y = dict(y)  # defensive copy
+
+    y["log_return_1d"] *= TARGET_SCALE
+    y["log_return_3d"] *= TARGET_SCALE
+    y["log_return_5d"] *= TARGET_SCALE
+
+    clip = 10.0 * TARGET_SCALE
+    y["log_return_1d"] = tf.clip_by_value(y["log_return_1d"], -clip, clip)
+    y["log_return_3d"] = tf.clip_by_value(y["log_return_3d"], -clip, clip)
+    y["log_return_5d"] = tf.clip_by_value(y["log_return_5d"], -clip, clip)
+
+    return x, y
+
+
+def split_train_validation(
+    stock_data: pd.DataFrame, news_data: pd.DataFrame, target_data: pd.DataFrame
+):
+    n = len(stock_data)
+
+    min_val = WINDOW_SIZE * 2
+    max_val = int(n * VALIDATION_MAX_RATIO)
+
+    if max_val < min_val:
+        raise ValueError(
+            f"Not enough data for validation: "
+            f"len={n}, min_val={min_val}, max_val={max_val}"
+        )
+
+    val_size = max_val
+    val_start = n - val_size
+
+    # training must end early enough to form windows
+    if val_start < WINDOW_SIZE:
+        raise ValueError(
+            f"Training set too small after split: "
+            f"val_start={val_start}, window_size={WINDOW_SIZE}"
+        )
+
+    stock_train = stock_data.iloc[:val_start]
+    news_train = news_data.iloc[:val_start]
+    target_train = target_data.iloc[:val_start]
+
+    # validation needs window_size lookback
+    stock_val = stock_data.iloc[val_start - WINDOW_SIZE :]
+    news_val = news_data.iloc[val_start - WINDOW_SIZE :]
+    target_val = target_data.iloc[val_start - WINDOW_SIZE :]
+
+    return (
+        stock_train,
+        news_train,
+        target_train,
+        stock_val,
+        news_val,
+        target_val,
+        val_size,
+    )
+
+
 def train():
     try:
+        # mixed_precision.set_global_policy("mixed_float16")
+
         gpus = tf.config.list_physical_devices("GPU")
         for gpu in gpus:
             tf.config.experimental.set_memory_growth(gpu, True)
-
         tf.config.optimizer.set_jit(False)
         tf.config.threading.set_intra_op_parallelism_threads(2)
         tf.config.threading.set_inter_op_parallelism_threads(2)
 
         stock_data, news_data, target_data = get_training_data()
-        LOGGER.debug("get_training_data")
+
         (
-            X_stock,
-            X_news,
-            Y_z,
-            Y_rank,
-            Y_dir,
-            Y_lr_1d,
-            Y_lr_3d,
-            Y_lr_5d,
-        ) = build_windows(
+            stock_train,
+            news_train,
+            target_train,
+            stock_val,
+            news_val,
+            target_val,
+            val_size,
+        ) = split_train_validation(
             stock_data,
             news_data,
             target_data,
         )
-        LOGGER.debug("build_windows")
 
-        Y_lr_1d *= TARGET_SCALE
-        Y_lr_3d *= TARGET_SCALE
-        Y_lr_5d *= TARGET_SCALE
+        train_ds, train_samples, stock_feature_count = build_training_dataset(
+            stock_data, news_data, target_data
+        )
 
-        Y_lr_1d = np.clip(Y_lr_1d, -10 * TARGET_SCALE, 10 * TARGET_SCALE)
-        Y_lr_3d = np.clip(Y_lr_3d, -10 * TARGET_SCALE, 10 * TARGET_SCALE)
-        Y_lr_5d = np.clip(Y_lr_5d, -10 * TARGET_SCALE, 10 * TARGET_SCALE)
+        # train_ds, train_samples, stock_feature_count = build_training_dataset(
+        #     stock_train, news_train, target_train
+        # )
 
-        assert X_stock.shape[2] == len(s.get_symbols())
+        # val_ds, val_samples, _ = build_training_dataset(stock_val, news_val, target_val)
 
-        symbol_count = Y_z.shape[1]
-        time_steps = X_stock.shape[1]
-        stock_feature_dim = X_stock.shape[3]
-        news_feature_dim = X_news.shape[2]
+        train_ds = train_ds.map(scale_targets, num_parallel_calls=1)
+        # val_ds = val_ds.map(scale_targets, num_parallel_calls=1)
+
+        train_steps = train_samples // BATCH_SIZE
+        # val_steps = val_samples // BATCH_SIZE
+
+        # if train_steps == 0 or val_steps == 0:
+        #     raise ValueError(
+        #         f"Invalid step count: train_steps={train_steps}, val_steps={val_steps}"
+        #     )
+
+        news_feature_dim = news_data.shape[1]
+
+        symbol_count = len(s.get_symbols())
 
         model = build_model(
-            time_steps,
-            stock_feature_dim,
-            news_feature_dim,
-            symbol_count,
+            time_steps=WINDOW_SIZE,
+            stock_feature_dim=stock_feature_count,
+            news_feature_dim=news_feature_dim,
+            symbol_count=symbol_count,
         )
 
         LOGGER.info(model.summary())
-
-        split = int(0.8 * len(X_stock))
 
         # keep only what fit needs
         del stock_data, news_data, target_data
         gc.collect()
 
         model.fit(
-            x={"stock": X_stock[:split], "news": X_news[:split]},
-            y={
-                "zscore_1d": Y_z[:split],
-                "rank_1d": Y_rank[:split],
-                "direction_1d": Y_dir[:split],
-                "log_return_1d": Y_lr_1d[:split],
-                "log_return_3d": Y_lr_3d[:split],
-                "log_return_5d": Y_lr_5d[:split],
-            },
-            validation_data=(
-                {"stock": X_stock[split:], "news": X_news[split:]},
-                {
-                    "zscore_1d": Y_z[split:],
-                    "rank_1d": Y_rank[split:],
-                    "direction_1d": Y_dir[split:],
-                    "log_return_1d": Y_lr_1d[split:],
-                    "log_return_3d": Y_lr_3d[split:],
-                    "log_return_5d": Y_lr_5d[split:],
-                },
-            ),
+            train_ds,
+            # validation_data=val_ds,
             epochs=EPOCHS,
-            batch_size=BATCH_SIZE,
-            validation_split=0.0,
-            shuffle=True,
+            steps_per_epoch=train_steps,
+            # validation_steps=val_steps,
             callbacks=[
                 EarlyStopping(
                     monitor="val_loss",
@@ -420,9 +448,10 @@ def train():
         write_model_s3(model, model_key)
 
         meta_out = {
-            "windowSize": time_steps,
             "symbolCount": symbol_count,
             "trainingCutoff": training_date,
+            "validationSize": val_size,
+            "windowSize": WINDOW_SIZE,
         }
         s.write_bytes_s3(meta_key, json.dumps(meta_out).encode("utf-8"))
 
