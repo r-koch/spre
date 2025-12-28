@@ -6,6 +6,7 @@ from datetime import date, timedelta
 
 # --- PROJECT ---
 import shared as s
+import training
 
 # --- THIRD-PARTY LAZY ---
 _numpy = None
@@ -41,36 +42,42 @@ def models():
 
 
 # --- CONFIG ---
-DEFAULT_LAST_INFERED_DATE = date.fromisoformat(
-    os.getenv("INFERENCE_START_DATE", "2025-12-19")
-)
-LAST_INFERED_KEY = "lastInferred"
+LAST_INFERRED_KEY = "lastInferred"
 
 LOGGER = s.setup_logger(__file__)
 
 
-def get_model_and_meta():
-    model_date = s.read_json_date_s3(s.TRAINING_STATE_KEY, s.LAST_TRAINED_KEY)
+def get_next_weekday(d: date) -> date:
+    d += timedelta(days=1)
+    while d.weekday() >= 5:
+        d += timedelta(days=1)
+    return d
+
+
+def get_model(model_date):
     model_key = f"{s.MODEL_PREFIX}{model_date}/{s.MODEL_FILE_NAME}"
-    meta_key = f"{s.MODEL_PREFIX}{model_date}/{s.META_FILE_NAME}"
 
     with tempfile.TemporaryDirectory() as tmp:
-        model_data = s.read_bytes_s3(model_key)
+        model_path = os.path.join(tmp, s.MODEL_FILE_NAME)
+        with open(model_path, "wb") as f:
+            f.write(s.read_bytes_s3(model_key))
 
-        local_model_path = os.path.join(tmp, s.MODEL_FILE_NAME)
-        with open(local_model_path, "wb") as f:
-            f.write(model_data)
-
-        model = models().load_model(local_model_path, compile=False)
-
-    meta_data = s.read_bytes_s3(meta_key)
-    meta = json.loads(meta_data.decode("utf-8"))
-
-    return model, meta
+        return models().load_model(model_path, compile=False)
 
 
-def get_latest_pivoted_date_before(inference_date: date) -> date:
+def get_model_metadata(model_date):
+    meta_key = f"{s.MODEL_PREFIX}{model_date}/{s.META_FILE_NAME}"
+    return json.loads(s.read_bytes_s3(meta_key))
+
+
+def get_latest_pivoted_date_before(before_date) -> date:
+    return get_latest_pivoted_dates_before(before_date)[0]
+
+
+def get_latest_pivoted_dates_before(before_date: date, count: int = 1) -> list[date]:
     keys = s.list_keys_s3(s.PIVOTED_PREFIX, sort_reversed=True)
+    found: list[date] = []
+
     for key in keys:
         table = s.read_parquet_column_s3(key, [s.LOCAL_DATE])
         dates = table[s.LOCAL_DATE]
@@ -78,179 +85,144 @@ def get_latest_pivoted_date_before(inference_date: date) -> date:
         for chunk in reversed(dates.chunks):
             for i in range(len(chunk) - 1, -1, -1):
                 d = chunk[i].as_py()
-                if d < inference_date:
-                    return d
-
-    raise ValueError(f"no pivoted date found before {inference_date}")
-
-
-def load_window(prefix: str, schema, end_date: date, window_size: int):
-    np = numpy()
-    value_columns = [name for name in schema.names if name != s.LOCAL_DATE]
-    collected_rows = []
-    keys = s.list_keys_s3(prefix, sort_reversed=True)
-    for key in keys:
-        table = s.read_parquet_s3(key, schema)
-        dates = table[s.LOCAL_DATE].to_numpy(zero_copy_only=False)
-        arrays = [table[col].to_numpy(zero_copy_only=False) for col in value_columns]
-
-        for i in range(len(dates) - 1, -1, -1):
-            if dates[i] <= end_date:
-                collected_rows.append([arr[i] for arr in arrays])
-                if len(collected_rows) == window_size:
+                if d < before_date:
+                    found.append(d)
+                    if len(found) == count:
+                        return found
+                elif d >= before_date:
+                    continue
+                else:
                     break
 
-        if len(collected_rows) == window_size:
-            break
-
-    if len(collected_rows) != window_size:
-        raise ValueError("Insufficient data for inference window")
-
-    collected_rows.reverse()
-    return np.stack(collected_rows, axis=0).astype(np.float32, copy=False)
+    raise ValueError(
+        f"Found {len(found)} pivoted dates before {before_date}, need {count}"
+    )
 
 
-def read_single_row_for_date(prefix: str, schema, target_date: date):
-    value_columns = [name for name in schema.names if name != s.LOCAL_DATE]
-
+def load_window(prefix, schema, end_date, window):
+    rows = []
     keys = s.list_keys_s3(prefix, sort_reversed=True)
+
+    np = numpy()
+
     for key in keys:
         table = s.read_parquet_s3(key, schema)
         dates = table[s.LOCAL_DATE]
 
         for chunk in reversed(dates.chunks):
             for i in range(len(chunk) - 1, -1, -1):
-                d = chunk[i].as_py()
+                if chunk[i].as_py() <= end_date:
+                    rows.append(
+                        [
+                            table[col][i].as_py()
+                            for col in schema.names
+                            if col != s.LOCAL_DATE
+                        ]
+                    )
+                    if len(rows) == window:
+                        rows.reverse()
+                        return np.asarray(rows, dtype="float32")
 
-                if d == target_date:
-                    return [table[col][i].as_py() for col in value_columns]
-
-                if d < target_date:
-                    break  # older than target → stop scanning this file
-
-    raise ValueError(f"Row not found for date {target_date}")
-
-
-def get_next_weekday(last: date) -> date:
-    next = last + timedelta(days=1)
-    while next.weekday() >= 5:  # 5=Sat, 6=Sun
-        next += timedelta(days=1)
-    return next
+    raise ValueError("Insufficient data for inference window")
 
 
 def infer(context=None):
     try:
-        max_inference_date = get_next_weekday(s.get_last_processed_date())
-        last_inferred_date = s.read_json_date_s3(
-            s.INFERENCE_STATE_KEY,
-            LAST_INFERED_KEY,
-            DEFAULT_LAST_INFERED_DATE,
-        )
-        inference_date = get_next_weekday(last_inferred_date)
-        if inference_date > max_inference_date:
-            return s.result(LOGGER, 200, "inference is up to date")
+        model_date = s.read_json_date_s3(s.TRAINING_STATE_KEY, s.LAST_TRAINED_KEY)
+        meta = get_model_metadata(model_date)
 
-        np = numpy()
-        pa = pyarrow()
+        max_date = get_next_weekday(s.get_last_processed_date())
+        last_inferred = s.read_json_date_s3(s.INFERENCE_STATE_KEY, LAST_INFERRED_KEY)
+        if last_inferred is None:
+            training_date = date.fromisoformat(meta["trainingCutoff"])
+            inference_date = get_latest_pivoted_dates_before(training_date, 2)[0]
+        else:
+            inference_date = get_next_weekday(last_inferred)
 
-        model, meta = get_model_and_meta()
+        if inference_date > max_date:
+            return s.result(LOGGER, 200, "inference up to date")
 
-        window_size = meta["windowSize"]
-        norm = meta["normalization"]
-        mean = np.asarray(norm["mean"], dtype=np.float32)
-        std = np.asarray(norm["std"], dtype=np.float32)
-        stock_feature_count = norm["stockFeatureCount"]
+        model = get_model(model_date)
 
-        mean_stock = mean[:, :stock_feature_count]
-        mean_news = mean[:, stock_feature_count:]
-        std_stock = std[:, :stock_feature_count]
-        std_news = std[:, stock_feature_count:]
-
+        window = meta["windowSize"]
         symbols = s.get_symbols()
+
         pivoted_schema = s.get_pivoted_schema()
         lagged_schema = s.get_lagged_schema()
         inference_schema = s.get_inference_schema()
 
-        end_date = get_latest_pivoted_date_before(inference_date)
-        stock_window = load_window(
-            s.PIVOTED_PREFIX, pivoted_schema, end_date, window_size
-        )
-        news_window = load_window(s.LAGGED_PREFIX, lagged_schema, end_date, window_size)
-
-        num_rows = stock_window.shape[0]
-        num_stock_features = stock_window.shape[1]
-        num_news_features = news_window.shape[1]
-
-        assert num_stock_features == stock_feature_count
-        assert num_stock_features + num_news_features == mean.shape[1]
-
-        x = np.empty((num_rows, mean.shape[1]), dtype=np.float32)
+        pa = pyarrow()
 
         while s.continue_execution(context, logger=LOGGER):
 
-            x[:, :stock_feature_count] = (stock_window - mean_stock) / std_stock
-            x[:, stock_feature_count:] = (news_window - mean_news) / std_news
+            end_date = get_latest_pivoted_date_before(inference_date)
 
-            x_reshaped = x.reshape(1, *x.shape)
-            preds = model(x_reshaped, training=False).numpy()[0].astype(np.float32)
+            stock_window = load_window(
+                s.PIVOTED_PREFIX, pivoted_schema, end_date, window
+            )
+            news_window = load_window(s.LAGGED_PREFIX, lagged_schema, end_date, window)
 
-            if not np.isfinite(preds).all():
-                raise ValueError("Inference produced NaN/Inf predictions")
+            # reshape
+            stock_window = stock_window.reshape(1, window, len(symbols), -1).astype(
+                "float32", copy=False
+            )
+            news_window = news_window.reshape(1, window, -1).astype(
+                "float32", copy=False
+            )
 
-            inference_table = pa.Table.from_arrays(
+            preds = model(
+                {"stock": stock_window, "news": news_window},
+                training=False,
+            )
+
+            (
+                zscore,
+                rank,
+                direction,
+                log_r1,
+                log_r3,
+                log_r5,
+            ) = [p.numpy()[0].astype("float32", copy=False) for p in preds]
+
+            inv_scale = 1.0 / s.TARGET_SCALE
+
+            log_r1 *= inv_scale
+            log_r3 *= inv_scale
+            log_r5 *= inv_scale
+
+            table = pa.Table.from_arrays(
                 [
                     pa.array([inference_date] * len(symbols), pa.date32()),
                     pa.array(symbols, pa.string()),
-                    pa.array(preds, pa.float32()),
+                    pa.array(zscore, pa.float32()),
+                    pa.array(rank, pa.float32()),
+                    pa.array(direction, pa.float32()),
+                    pa.array(log_r1, pa.float32()),
+                    pa.array(log_r3, pa.float32()),
+                    pa.array(log_r5, pa.float32()),
                 ],
                 schema=inference_schema,
             )
-            inference_key = (
-                f"{s.INFERENCE_PREFIX}{inference_date.isoformat()}/data.parquet"
-            )
-            s.write_parquet_s3(inference_key, inference_table, inference_schema)
 
-            training_cutoff = meta["trainingCutoff"]
-            inference_meta = {
-                "modelPrefix": f"{s.MODEL_PREFIX}{training_cutoff}",
-                "inferenceDate": inference_date.isoformat(),
-                "trainingCutoff": training_cutoff,
-            }
-            inference_meta_key = (
-                f"{s.INFERENCE_PREFIX}{inference_date.isoformat()}/meta.json"
-            )
-            inference_meta_data = json.dumps(inference_meta, indent=2).encode("utf-8")
-            s.write_bytes_s3(inference_meta_key, inference_meta_data)
+            key = f"{s.INFERENCE_PREFIX}{inference_date}/data.parquet"
+            s.write_parquet_s3(key, table, table.schema)
 
             s.write_json_date_s3(
-                s.INFERENCE_STATE_KEY, LAST_INFERED_KEY, inference_date
+                s.INFERENCE_STATE_KEY,
+                LAST_INFERRED_KEY,
+                inference_date,
             )
-            LOGGER.info(f"finished inference for {inference_date}")
+
+            LOGGER.info(f"Inference completed for {inference_date}")
 
             inference_date = get_next_weekday(inference_date)
-
-            if inference_date > max_inference_date:
+            if inference_date > max_date:
                 break
 
-            end_date = get_latest_pivoted_date_before(inference_date)
-
-            new_stock_row = read_single_row_for_date(
-                s.PIVOTED_PREFIX, pivoted_schema, end_date
-            )
-            new_news_row = read_single_row_for_date(
-                s.LAGGED_PREFIX, lagged_schema, end_date
-            )
-
-            stock_window[:-1] = stock_window[1:]
-            stock_window[-1] = new_stock_row
-
-            news_window[:-1] = news_window[1:]
-            news_window[-1] = new_news_row
-
-        return s.result(LOGGER, 200, f"finished infer")
+        return s.result(LOGGER, 200, "finished inference")
 
     except Exception:
-        LOGGER.exception("Error in infer")
+        LOGGER.exception("Inference failed")
         return {"statusCode": 500, "body": "error"}
 
 

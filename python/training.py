@@ -12,6 +12,7 @@ import shared as s
 import numpy as np
 import pyarrow as pa
 import tensorflow as tf
+from keras.saving import register_keras_serializable
 from tensorflow.keras import layers, losses, models, optimizers  # type: ignore
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau  # type: ignore
 
@@ -45,6 +46,7 @@ REDUCE_LR_ON_PLATEAU_MIN_LR = float(os.getenv("REDUCE_LR_ON_PLATEAU_MIN_LR", "1e
 LOGGER = s.setup_logger(__file__)
 
 
+@register_keras_serializable(package="spre")
 class MeanOverSymbols(layers.Layer):
     # Reduces (batch, time, symbols, embed) -> (batch, time, embed)
     # by averaging over the symbol axis.
@@ -55,9 +57,6 @@ class MeanOverSymbols(layers.Layer):
     def compute_output_shape(self, input_shape):
         # input_shape: (batch, time, symbols, embed)
         return (input_shape[0], input_shape[1], input_shape[3])
-
-    def get_config(self):
-        return super().get_config()
 
 
 def deduplicate(table):

@@ -45,10 +45,19 @@ def get_inferences() -> tuple[
         date_str = key.split(s.INFERENCE_PREFIX, 1)[1].split("/", 1)[0]
 
         table = s.read_parquet_s3(key, schema)
-        symbols = table["symbol"].to_pylist()
-        preds = table["predicted_log_return"].to_pylist()
 
-        return date.fromisoformat(date_str), dict(zip(symbols, preds))
+        return (
+            date.fromisoformat(date_str),
+            {
+                "symbol": table["symbol"].to_pylist(),
+                "zscore_1d": table["zscore_1d"].to_pylist(),
+                "rank_1d": table["rank_1d"].to_pylist(),
+                "direction_1d": table["direction_1d"].to_pylist(),
+                "log_return_1d": table["log_return_1d"].to_pylist(),
+                "log_return_3d": table["log_return_3d"].to_pylist(),
+                "log_return_5d": table["log_return_5d"].to_pylist(),
+            },
+        )
 
     latest = load(keys[0])
     previous = load(keys[1])
@@ -56,24 +65,38 @@ def get_inferences() -> tuple[
     return latest, previous
 
 
-def get_returns(py_date: date) -> dict[str, float]:
+def get_actual(py_date: date) -> dict[str, dict[str, float]]:
     keys = s.list_keys_s3(s.TARGET_PREFIX, sort_reversed=True)
     schema = s.get_target_schema()
 
     for key in keys:
         table = s.read_parquet_s3(key, schema)
-        dates = table["localDate"].to_pylist()
+        dates = table[s.LOCAL_DATE].to_pylist()
 
         for i, d in enumerate(dates):
             if d == py_date:
-                out = {}
+                out: dict[str, dict[str, float]] = {}
                 for name in schema.names:
-                    if name != "localDate":
-                        sym = name.removesuffix("_return")
-                        out[sym] = table[name][i].as_py()
+                    if name != s.LOCAL_DATE:
+                        sym, metric = name.split("_", 1)
+                        out.setdefault(sym, {})[metric] = table[name][i].as_py()
                 return out
 
     raise ValueError(f"No actual returns for {py_date}")
+
+
+def unpack(pred):
+    return {
+        sym: {
+            "zscore_1d": pred["zscore_1d"][i],
+            "rank_1d": pred["rank_1d"][i],
+            "direction_1d": pred["direction_1d"][i],
+            "log_return_1d": pred["log_return_1d"][i],
+            "log_return_3d": pred["log_return_3d"][i],
+            "log_return_5d": pred["log_return_5d"][i],
+        }
+        for i, sym in enumerate(pred["symbol"])
+    }
 
 
 def get_top_gainers(pred: dict[str, float]) -> list[tuple[str, float]]:
@@ -127,7 +150,10 @@ def notify():
 
         (latest_date, latest_pred), (previous_date, previous_pred) = get_inferences()
 
-        previous_actual = get_returns(previous_date)
+        latest_map = unpack(latest_pred)
+        prev_map = unpack(previous_pred)
+
+        previous_actual = get_actual(previous_date)
 
         lines = []
 
@@ -136,45 +162,70 @@ def notify():
         # Predicted gain/loss of watched symbols for day X+1
         lines.append("Watched symbols")
         for sym in WATCHED_SYMBOLS:
-            if sym in latest_pred:
-                pred = latest_pred[sym]
+            if sym in latest_map:
+                m = latest_map[sym]
                 lines.append(
-                    f"{sym:<6}  {pred:+.5f}  {"GAIN" if sign(pred) > 0 else "LOSS"}"
+                    f"{sym:<6} "
+                    f"{m['zscore_1d']:+.3f} "
+                    f"{m['rank_1d']:+.3f} "
+                    f"{m['direction_1d']:.2f} "
+                    f"{m['log_return_1d']:+.5f} "
+                    f"{m['log_return_3d']:+.5f} "
+                    f"{m['log_return_5d']:+.5f}"
                 )
         lines.append("")
 
-        # Top K predicted gainers for day X+1
-        top_gainers = get_top_gainers(latest_pred)
-        lines.append(f"Top-{TOP_GAINERS_COUNT} gainers")
-        for sym, val in top_gainers:
-            lines.append(f"{sym:<6}  {val:+.5f}")
-        lines.append("")
+        # # Top K predicted gainers for day X+1
+        # top_gainers = get_top_gainers(latest_pred)
+        # lines.append(f"Top-{TOP_GAINERS_COUNT} gainers")
+        # for sym, val in top_gainers:
+        #     lines.append(f"{sym:<6}  {val:+.5f}")
+        # lines.append("")
 
         lines.append(f"{previous_date} predicted vs actual")
 
         # Predicted vs actual for watched symbols for day X
         lines.append("Watched symbols")
-        lines.append("Symbol  Predicted  Actual  Result")
-        for sym in WATCHED_SYMBOLS:
-            if sym in previous_pred and sym in previous_actual:
-                pred = previous_pred[sym]
-                act = previous_actual[sym]
-                lines.append(
-                    f"{sym:<6}  {pred:+.5f}  {act:+.5f}  {'OK' if sign(pred) == sign(act) else 'FAIL'}"
-                )
-        lines.append("")
-
-        # Directional accuracy overall for day X
-        correct, total = get_directional_accuracy(previous_pred, previous_actual)
-        pct = (correct / total * 100.0) if total else 0.0
-        lines.append(f"Directional accuracy: {correct} / {total} ({pct:.1f}%)")
-
-        # Top K hit rate for day X
-        hits = get_top_gainers_hit_rate(top_gainers, previous_actual)
         lines.append(
-            f"Top-{TOP_GAINERS_COUNT} hit rate:      {hits} / {TOP_GAINERS_COUNT}"
+            "Symbol   "
+            "z_p     z_a     "
+            "r_p     r_a     "
+            "d_p d_a "
+            "lr1_p    lr1_a    "
+            "lr3_p    lr3_a    "
+            "lr5_p    lr5_a"
         )
+
+        for sym in WATCHED_SYMBOLS:
+            if sym not in prev_map or sym not in previous_actual:
+                continue
+
+            p = prev_map[sym]
+            a = previous_actual[sym]
+
+            lines.append(
+                f"{sym:<6} "
+                f"{p['zscore_1d']:+.3f} {a['zscore_1d']:+.3f} "
+                f"{p['rank_1d']:+.3f} {a['rank_1d']:+.3f} "
+                f"{int(p['direction_1d'] >= 0.5):^3} {a['direction_1d']:^3} "
+                f"{p['log_return_1d']:+.5f} {a['log_return_1d']:+.5f} "
+                f"{p['log_return_3d']:+.5f} {a['log_return_3d']:+.5f} "
+                f"{p['log_return_5d']:+.5f} {a['log_return_5d']:+.5f}"
+            )
+
         lines.append("")
+
+        # # Directional accuracy overall for day X
+        # correct, total = get_directional_accuracy(previous_pred, previous_actual)
+        # pct = (correct / total * 100.0) if total else 0.0
+        # lines.append(f"Directional accuracy: {correct} / {total} ({pct:.1f}%)")
+
+        # # Top K hit rate for day X
+        # hits = get_top_gainers_hit_rate(top_gainers, previous_actual)
+        # lines.append(
+        #     f"Top-{TOP_GAINERS_COUNT} hit rate:      {hits} / {TOP_GAINERS_COUNT}"
+        # )
+        # lines.append("")
 
         body = "\n".join(lines)
         subject = f"{latest_date} spre"

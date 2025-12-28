@@ -212,7 +212,12 @@ def get_inference_schema():
             {
                 LOCAL_DATE: pa.date32(),
                 "symbol": pa.string(),
-                "predicted_log_return": pa.float32(),
+                "zscore_1d": pa.float32(),
+                "rank_1d": pa.float32(),
+                "direction_1d": pa.float32(),
+                "log_return_1d": pa.float32(),
+                "log_return_3d": pa.float32(),
+                "log_return_5d": pa.float32(),
             }
         )
     return _inference_schema
