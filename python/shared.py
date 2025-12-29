@@ -66,7 +66,7 @@ LAGGED_PREFIX = f"news/lagged-{LAG_DAYS}/"
 
 LOCAL_DATE = "localDate"
 
-MODEL_PREFIX = f"model/{LOCAL_DATE}="
+MODEL_PREFIX = "model/score="
 MODEL_FILE_NAME = "model.keras"
 META_FILE_NAME = "meta.json"
 TARGET_SCALE = float(os.getenv("TARGET_SCALE", "1000.0"))

@@ -67,6 +67,9 @@ REDUCE_LR_ON_PLATEAU_FACTOR = float(os.getenv("REDUCE_LR_ON_PLATEAU_FACTOR", "0.
 REDUCE_LR_ON_PLATEAU_PATIENCE = int(os.getenv("REDUCE_LR_ON_PLATEAU_PATIENCE", "5"))
 REDUCE_LR_ON_PLATEAU_MIN_LR = float(os.getenv("REDUCE_LR_ON_PLATEAU_MIN_LR", "1e-5"))
 
+MODEL_SCORE_DIRECTION_ACC_FACTOR = 0.50
+MODEL_SCORE_RANK_SPEARMAN_FACTOR = 0.30
+MODEL_SCORE_RMSE_LOG_RET_FACTOR = 0.20
 
 LOGGER = s.setup_logger(__file__)
 
@@ -408,6 +411,81 @@ def split_train_validation(
     )
 
 
+def evaluate_on_validation(model, val_ds, symbol_count):
+    target_scale = s.TARGET_SCALE
+
+    dir_correct = 0
+    dir_total = 0
+
+    rank_corrs = []
+    sq_err_sum = 0.0
+    sq_err_count = 0
+
+    for x, y_true in val_ds:
+        preds = model(x, training=False)
+
+        (
+            _,
+            rank_pred,
+            dir_pred,
+            lr1_pred,
+            _,
+            _,
+        ) = preds
+
+        # --- inverse target scaling ---
+        inv = 1.0 / target_scale
+        lr1_pred = lr1_pred * inv
+
+        rank_pred = rank_pred.numpy()
+        dir_pred = dir_pred.numpy()
+        lr1_pred = lr1_pred.numpy()
+
+        rank_true = y_true["rank_1d"].numpy()
+        dir_true = y_true["direction_1d"].numpy()
+        lr1_true = y_true["log_return_1d"].numpy()
+
+        # --- directional accuracy ---
+        dir_pred_bin = (dir_pred > 0.5).astype("int8")
+        dir_correct += (dir_pred_bin == dir_true).sum()
+        dir_total += dir_true.size
+
+        # --- rank spearman (per day) ---
+        for i in range(rank_true.shape[0]):  # batch dimension
+            r_true = rank_true[i]
+            r_pred = rank_pred[i]
+
+            if symbol_count > 1:
+                corr = np.corrcoef(
+                    r_true.argsort(),
+                    r_pred.argsort(),
+                )[0, 1]
+                if not np.isnan(corr):
+                    rank_corrs.append(corr)
+
+        # --- RMSE log return ---
+        diff = lr1_pred - lr1_true
+        sq_err_sum += np.sum(diff * diff)
+        sq_err_count += diff.size
+
+    direction_acc = dir_correct / dir_total if dir_total else 0.0
+    rank_spearman = float(np.mean(rank_corrs)) if rank_corrs else 0.0
+    rmse_log_ret = float(np.sqrt(sq_err_sum / sq_err_count)) if sq_err_count else 0.0
+
+    model_score = (
+        MODEL_SCORE_DIRECTION_ACC_FACTOR * direction_acc
+        + MODEL_SCORE_RANK_SPEARMAN_FACTOR * rank_spearman
+        - MODEL_SCORE_RMSE_LOG_RET_FACTOR * rmse_log_ret
+    )
+
+    return {
+        "direction_acc_1d": float(direction_acc),
+        "rank_spearman_1d": float(rank_spearman),
+        "rmse_log_return_1d": float(rmse_log_ret),
+        "model_score": float(model_score),
+    }
+
+
 def train():
     try:
         gpus = tf.config.list_physical_devices("GPU")
@@ -423,7 +501,7 @@ def train():
             stock_val,
             news_val,
             target_val,
-            val_size,
+            validation_size,
         ) = split_train_validation(
             stock_table,
             news_table,
@@ -476,16 +554,58 @@ def train():
 
         # --- persist ---
         training_date = date.today().isoformat()
-        model_key = f"{s.MODEL_PREFIX}{training_date}/{s.MODEL_FILE_NAME}"
-        meta_key = f"{s.MODEL_PREFIX}{training_date}/{s.META_FILE_NAME}"
+
+        metrics = evaluate_on_validation(
+            model,
+            val_ds,
+            symbol_count,
+        )
+
+        model_score = f"{metrics['model_score']:.4f}"
+
+        model_key = f"{s.MODEL_PREFIX}{model_score}/{s.MODEL_FILE_NAME}"
+        meta_key = f"{s.MODEL_PREFIX}{model_score}/{s.META_FILE_NAME}"
 
         write_model_s3(model, model_key)
 
         meta_out = {
-            "symbolCount": symbol_count,
-            "trainingCutoff": training_date,
-            "validationSize": val_size,
-            "windowSize": WINDOW_SIZE,
+            "symbol_count": symbol_count,
+            "training_date": training_date,
+            "validation_size": validation_size,
+            "metrics": metrics,
+            "config": {
+                "batch_size": BATCH_SIZE,
+                "epochs": EPOCHS,
+                "window_size": WINDOW_SIZE,
+                "validation_max_ratio": VALIDATION_MAX_RATIO,
+                "validation_to_window_ratio": VALIDATION_TO_WINDOW_RATIO,
+                "target_scale_clip_factor": TARGET_SCALE_CLIP_FACTOR,
+                "stock_attention_heads": STOCK_ATTENTION_HEADS,
+                "stock_embed": STOCK_EMBED,
+                "news_attention_heads": NEWS_ATTENTION_HEADS,
+                "news_embed": NEWS_EMBED,
+                "shared_trunk_size_1": SHARED_TRUNK_SIZE_1,
+                "shared_trunk_size_2": SHARED_TRUNK_SIZE_2,
+                "learning_rate": LEARNING_RATE,
+                "losses_huber_delta": LOSSES_HUBER_DELTA,
+                "loss_zscore_1d": LOSS_ZSCORE_1D,
+                "loss_rank_1d": str(LOSS_RANK_1D),
+                "loss_direction_1d": LOSS_DIRECTION_1D,
+                "loss_log_return_1d": LOSS_LOG_RETURN_1D,
+                "loss_log_return_3d": LOSS_LOG_RETURN_3D,
+                "loss_log_return_5d": LOSS_LOG_RETURN_5D,
+                "loss_weight_zscore_1d": LOSS_WEIGHT_ZSCORE_1D,
+                "loss_weight_rank_1d": LOSS_WEIGHT_RANK_1D,
+                "loss_weight_direction_1d": LOSS_WEIGHT_DIRECTION_1D,
+                "loss_weight_log_return_1d": LOSS_WEIGHT_LOG_RETURN_1D,
+                "loss_weight_log_return_3d": LOSS_WEIGHT_LOG_RETURN_3D,
+                "loss_weight_log_return_5d": LOSS_WEIGHT_LOG_RETURN_5D,
+                "early_stopping_patience": EARLY_STOPPING_PATIENCE,
+                "early_stopping_restore_best_weigths": EARLY_STOPPING_RESTORE_BEST_WEIGTHS,
+                "reduce_lr_on_plateau_factor": REDUCE_LR_ON_PLATEAU_FACTOR,
+                "reduce_lr_on_plateau_patience": REDUCE_LR_ON_PLATEAU_PATIENCE,
+                "reduce_lr_on_plateau_min_lr": REDUCE_LR_ON_PLATEAU_MIN_LR,
+            },
         }
         s.write_bytes_s3(meta_key, json.dumps(meta_out).encode("utf-8"))
 
