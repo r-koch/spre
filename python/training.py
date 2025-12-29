@@ -26,17 +26,42 @@ BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1"))
 EPOCHS = int(os.getenv("EPOCHS", "50"))
 WINDOW_SIZE = int(os.getenv("WINDOW_SIZE", "10"))
 
+VALIDATION_MAX_RATIO = float(os.getenv("VALIDATION_MAX_RATIO", "0.2"))
+VALIDATION_TO_WINDOW_RATIO = float(os.getenv("VALIDATION_TO_WINDOW_RATIO", "2.0"))
+
+TARGET_SCALE_CLIP_FACTOR = float(os.getenv("TARGET_SCALE_CLIP_FACTOR", "10.0"))
+
 STOCK_ATTENTION_HEADS = int(os.getenv("SYMBOL_ATTENTION_HEADS", "1"))
 STOCK_EMBED = int(os.getenv("SYMBOL_EMBED", "8"))
 
 NEWS_ATTENTION_HEADS = int(os.getenv("NEWS_ATTENTION_HEADS", "1"))
 NEWS_EMBED = int(os.getenv("NEWS_EMBED", "8"))
 
-VALIDATION_MAX_RATIO = float(os.getenv("VALIDATION_MAX_RATIO", "0.2"))
+SHARED_TRUNK_SIZE_1 = int(os.getenv("EARLY_STOPPING_PATIENCE", "256"))
+SHARED_TRUNK_SIZE_2 = int(os.getenv("EARLY_STOPPING_PATIENCE", "128"))
 
 LEARNING_RATE = float(os.getenv("LEARNING_RATE", "1e-3"))
 
+LOSSES_HUBER_DELTA = float(os.getenv("LOSSES_HUBER_DELTA", "0.1"))
+
+LOSS_ZSCORE_1D = os.getenv("LOSS_ZSCORE_1D", "mse")
+LOSS_RANK_1D = losses.Huber(delta=LOSSES_HUBER_DELTA)
+LOSS_DIRECTION_1D = os.getenv("LOSS_DIRECTION_1D", "binary_crossentropy")
+LOSS_LOG_RETURN_1D = os.getenv("LOSS_LOG_RETURN_1D", "mse")
+LOSS_LOG_RETURN_3D = os.getenv("LOSS_LOG_RETURN_3D", "mse")
+LOSS_LOG_RETURN_5D = os.getenv("LOSS_LOG_RETURN_5D", "mse")
+
+LOSS_WEIGHT_ZSCORE_1D = float(os.getenv("LOSS_WEIGHT_ZSCORE_1D", "1.0"))
+LOSS_WEIGHT_RANK_1D = float(os.getenv("LOSS_WEIGHT_RANK_1D", "0.3"))
+LOSS_WEIGHT_DIRECTION_1D = float(os.getenv("LOSS_WEIGHT_DIRECTION_1D", "0.3"))
+LOSS_WEIGHT_LOG_RETURN_1D = float(os.getenv("LOSS_WEIGHT_LOG_RETURN_1D", "0.05"))
+LOSS_WEIGHT_LOG_RETURN_3D = float(os.getenv("LOSS_WEIGHT_LOG_RETURN_3D", "0.05"))
+LOSS_WEIGHT_LOG_RETURN_5D = float(os.getenv("LOSS_WEIGHT_LOG_RETURN_5D", "0.05"))
+
 EARLY_STOPPING_PATIENCE = int(os.getenv("EARLY_STOPPING_PATIENCE", "15"))
+EARLY_STOPPING_RESTORE_BEST_WEIGTHS = bool(
+    os.getenv("EARLY_STOPPING_RESTORE_BEST_WEIGTHS", "True")
+)  # empty for False
 
 REDUCE_LR_ON_PLATEAU_FACTOR = float(os.getenv("REDUCE_LR_ON_PLATEAU_FACTOR", "0.5"))
 REDUCE_LR_ON_PLATEAU_PATIENCE = int(os.getenv("REDUCE_LR_ON_PLATEAU_PATIENCE", "5"))
@@ -138,7 +163,9 @@ def table_to_numpy(table: pa.Table) -> np.ndarray:
     return out
 
 
-def build_training_dataset(stock_table, news_table, target_table):
+def build_training_dataset(
+    stock_table: pa.Table, news_table: pa.Table, target_table: pa.Table
+) -> tuple[tf.data.Dataset, int, int, int]:
     symbols = s.get_symbols()
     symbol_count = len(symbols)
     window = WINDOW_SIZE
@@ -231,7 +258,9 @@ def build_training_dataset(stock_table, news_table, target_table):
     return ds, stock_feature_count, news_feature_count, symbol_count
 
 
-def build_model(time_steps, stock_feature_dim, news_feature_dim, symbol_count):
+def build_model(
+    time_steps: int, stock_feature_dim: int, news_feature_dim: int, symbol_count: int
+) -> models.Model:
 
     stock_in = layers.Input(
         shape=(time_steps, symbol_count, stock_feature_dim), name="stock"
@@ -271,8 +300,8 @@ def build_model(time_steps, stock_feature_dim, news_feature_dim, symbol_count):
     x = layers.Concatenate()([x, y])
 
     # --- shared trunk ---
-    shared = layers.Dense(256, activation="relu")(x)
-    shared = layers.Dense(128, activation="relu")(shared)
+    shared = layers.Dense(SHARED_TRUNK_SIZE_1, activation="relu")(x)
+    shared = layers.Dense(SHARED_TRUNK_SIZE_2, activation="relu")(shared)
 
     # --- heads ---
     def head(name, activation=None):
@@ -298,20 +327,20 @@ def build_model(time_steps, stock_feature_dim, news_feature_dim, symbol_count):
     model.compile(
         optimizer=optimizers.Adam(LEARNING_RATE),
         loss={
-            "zscore_1d": "mse",
-            "rank_1d": losses.Huber(delta=0.1),
-            "direction_1d": "binary_crossentropy",
-            "log_return_1d": "mse",
-            "log_return_3d": "mse",
-            "log_return_5d": "mse",
+            "zscore_1d": LOSS_ZSCORE_1D,
+            "rank_1d": LOSS_RANK_1D,
+            "direction_1d": LOSS_DIRECTION_1D,
+            "log_return_1d": LOSS_LOG_RETURN_1D,
+            "log_return_3d": LOSS_LOG_RETURN_3D,
+            "log_return_5d": LOSS_LOG_RETURN_5D,
         },
         loss_weights={
-            "zscore_1d": 1.0,
-            "rank_1d": 0.3,
-            "direction_1d": 0.3,
-            "log_return_1d": 0.05,
-            "log_return_3d": 0.05,
-            "log_return_5d": 0.05,
+            "zscore_1d": LOSS_WEIGHT_ZSCORE_1D,
+            "rank_1d": LOSS_WEIGHT_RANK_1D,
+            "direction_1d": LOSS_WEIGHT_DIRECTION_1D,
+            "log_return_1d": LOSS_WEIGHT_LOG_RETURN_1D,
+            "log_return_3d": LOSS_WEIGHT_LOG_RETURN_3D,
+            "log_return_5d": LOSS_WEIGHT_LOG_RETURN_5D,
         },
     )
 
@@ -338,7 +367,7 @@ def scale_targets(x, y):
     y["log_return_3d"] *= target_scale
     y["log_return_5d"] *= target_scale
 
-    clip = 10.0 * target_scale
+    clip = TARGET_SCALE_CLIP_FACTOR * target_scale
     y["log_return_1d"] = tf.clip_by_value(y["log_return_1d"], -clip, clip)
     y["log_return_3d"] = tf.clip_by_value(y["log_return_3d"], -clip, clip)
     y["log_return_5d"] = tf.clip_by_value(y["log_return_5d"], -clip, clip)
@@ -348,10 +377,10 @@ def scale_targets(x, y):
 
 def split_train_validation(
     stock_table: pa.Table, news_table: pa.Table, target_table: pa.Table
-):
+) -> tuple[pa.Table, pa.Table, pa.Table, pa.Table, pa.Table, pa.Table, int]:
     n = stock_table.num_rows
 
-    min_val = WINDOW_SIZE * 2
+    min_val = WINDOW_SIZE * VALIDATION_TO_WINDOW_RATIO
     max_val = int(n * VALIDATION_MAX_RATIO)
 
     if max_val < min_val:
@@ -438,9 +467,9 @@ def train():
                 ),
                 ReduceLROnPlateau(
                     monitor="val_loss",
-                    factor=0.5,
-                    patience=5,
-                    min_lr=1e-5,
+                    factor=REDUCE_LR_ON_PLATEAU_FACTOR,
+                    patience=REDUCE_LR_ON_PLATEAU_PATIENCE,
+                    min_lr=REDUCE_LR_ON_PLATEAU_MIN_LR,
                 ),
             ],
         )
@@ -466,7 +495,7 @@ def train():
             date.fromisoformat(training_date),
         )
 
-        return s.result(LOGGER, 200, "training finished")
+        LOGGER.info("training finished")
 
     except Exception:
         LOGGER.exception("Error in train")
