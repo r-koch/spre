@@ -7,12 +7,12 @@ from datetime import date
 
 # --- PROJECT ---
 import shared as s
+import shared_model as sm
 
 # --- THIRD-PARTY ---
 import numpy as np
 import pyarrow as pa
 import tensorflow as tf
-from keras.saving import register_keras_serializable
 from tensorflow.keras import layers, losses, models, optimizers  # type: ignore
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau  # type: ignore
 
@@ -72,19 +72,6 @@ MODEL_SCORE_RANK_SPEARMAN_FACTOR = 0.30
 MODEL_SCORE_RMSE_LOG_RET_FACTOR = 0.20
 
 LOGGER = s.setup_logger(__file__)
-
-
-@register_keras_serializable(package="spre")
-class MeanOverSymbols(layers.Layer):
-    # Reduces (batch, time, symbols, embed) -> (batch, time, embed)
-    # by averaging over the symbol axis.
-
-    def call(self, inputs):
-        return tf.reduce_mean(inputs, axis=2)
-
-    def compute_output_shape(self, input_shape):
-        # input_shape: (batch, time, symbols, embed)
-        return (input_shape[0], input_shape[1], input_shape[3])
 
 
 def deduplicate(table):
@@ -277,7 +264,7 @@ def build_model(
     # (batch, time, symbols, embed)
 
     # --- pool symbols ---
-    x = MeanOverSymbols(name="pool_symbols")(x)
+    x = sm.MeanOverSymbols(name="pool_symbols")(x)
 
     # (batch, time, embed)
 
@@ -608,12 +595,6 @@ def train():
             },
         }
         s.write_bytes_s3(meta_key, json.dumps(meta_out).encode("utf-8"))
-
-        s.write_json_date_s3(
-            s.TRAINING_STATE_KEY,
-            s.LAST_TRAINED_KEY,
-            date.fromisoformat(training_date),
-        )
 
         LOGGER.info("training finished")
 

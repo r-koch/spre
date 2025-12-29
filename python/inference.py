@@ -6,11 +6,11 @@ from datetime import date, timedelta
 
 # --- PROJECT ---
 import shared as s
-import training
 
 # --- THIRD-PARTY LAZY ---
 _numpy = None
 _pyarrow = None
+_shared_model = None
 _tensorflow_keras_models = None
 
 
@@ -30,6 +30,15 @@ def pyarrow():
 
         _pyarrow = pa
     return _pyarrow
+
+
+def shared_model():
+    global _shared_model
+    if _shared_model is None:
+        import shared_model as sm
+
+        _shared_model = sm
+    return _shared_model
 
 
 def models():
@@ -54,19 +63,52 @@ def get_next_weekday(d: date) -> date:
     return d
 
 
-def get_model(model_date):
-    model_key = f"{s.MODEL_PREFIX}{model_date}/{s.MODEL_FILE_NAME}"
+def parse_score_from_key(key: str) -> float | None:
+    # expects: model/score={score}/model.keras
+    try:
+        part = key.split(s.MODEL_PREFIX, 1)[1]
+        score_str = part.split("/", 1)[0]
+        return float(score_str)
+    except Exception:
+        return None
 
+
+def get_best_model_key() -> str:
+    keys = s.list_keys_s3(s.MODEL_PREFIX)
+
+    best_score = None
+    best_key = None
+
+    for key in keys:
+        if not key.endswith(f"/{s.MODEL_FILE_NAME}"):
+            continue
+
+        score = parse_score_from_key(key)
+        if score is None:
+            continue
+
+        if best_score is None or score > best_score:
+            best_key = key
+            best_score = score
+
+    if best_score is None or best_key is None:
+        raise ValueError("No scored models found in model/")
+
+    return best_key
+
+
+def get_model(model_key):
     with tempfile.TemporaryDirectory() as tmp:
         model_path = os.path.join(tmp, s.MODEL_FILE_NAME)
         with open(model_path, "wb") as f:
             f.write(s.read_bytes_s3(model_key))
 
+        shared_model()
         return models().load_model(model_path, compile=False)
 
 
-def get_model_metadata(model_date):
-    meta_key = f"{s.MODEL_PREFIX}{model_date}/{s.META_FILE_NAME}"
+def get_model_metadata(model_key):
+    meta_key = model_key.replace(s.MODEL_FILE_NAME, s.META_FILE_NAME)
     return json.loads(s.read_bytes_s3(meta_key))
 
 
@@ -128,23 +170,22 @@ def load_window(prefix, schema, end_date, window):
 
 def infer(context=None):
     try:
-        model_date = s.read_json_date_s3(s.TRAINING_STATE_KEY, s.LAST_TRAINED_KEY)
-        meta = get_model_metadata(model_date)
+        model_key = get_best_model_key()
+        meta = get_model_metadata(model_key)
 
         max_date = get_next_weekday(s.get_last_processed_date())
         last_inferred = s.read_json_date_s3(s.INFERENCE_STATE_KEY, LAST_INFERRED_KEY)
         if last_inferred is None:
-            training_date = date.fromisoformat(meta["trainingCutoff"])
-            inference_date = get_latest_pivoted_dates_before(training_date, 2)[0]
+            inference_date = date.fromisoformat(meta["training_date"])
         else:
             inference_date = get_next_weekday(last_inferred)
 
         if inference_date > max_date:
             return s.result(LOGGER, 200, "inference up to date")
 
-        model = get_model(model_date)
+        model = get_model(model_key)
 
-        window = meta["windowSize"]
+        window = meta["config"]["window_size"]
         symbols = s.get_symbols()
 
         pivoted_schema = s.get_pivoted_schema()

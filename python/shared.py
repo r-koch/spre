@@ -46,7 +46,6 @@ ONE_DAY = timedelta(days=1)
 
 LAST_ADDED_KEY = "lastAdded"
 LAST_PROCESSED_KEY = "lastProcessed"
-LAST_TRAINED_KEY = "lastTrained"
 
 META_DATA = "metadata/"
 INFERENCE_STATE_KEY = f"{META_DATA}inference_state.json"
@@ -54,7 +53,6 @@ NEWS_COLLECTOR_STATE_KEY = f"{META_DATA}news_collector_state.json"
 NEWS_PREPROC_STATE_KEY = f"{META_DATA}news_preproc_state.json"
 STOCK_COLLECTOR_STATE_KEY = f"{META_DATA}stock_collector_state.json"
 STOCK_PREPROC_STATE_KEY = f"{META_DATA}stock_preproc_state.json"
-TRAINING_STATE_KEY = f"{META_DATA}training_state.json"
 
 SYMBOLS_KEY = "symbols/spx.parquet"
 
