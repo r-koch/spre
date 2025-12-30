@@ -243,7 +243,7 @@ def build_training_dataset(
     )
 
     ds = tf.data.Dataset.from_generator(gen, output_signature=output_signature)
-    ds = ds.batch(BATCH_SIZE, drop_remainder=True).prefetch(1)
+    ds = ds.batch(BATCH_SIZE, drop_remainder=True).prefetch(tf.data.AUTOTUNE)
 
     return ds, stock_feature_count, news_feature_count, symbol_count
 
@@ -398,78 +398,37 @@ def split_train_validation(
     )
 
 
-def evaluate_on_validation(model, val_ds, symbol_count):
-    target_scale = s.TARGET_SCALE
+def get_result_analysis(result) -> dict[str, float | dict[str, float]]:
+    history = result.history
 
-    dir_correct = 0
-    dir_total = 0
+    loss_weights = {
+        "zscore_1d": LOSS_WEIGHT_ZSCORE_1D,
+        "rank_1d": LOSS_WEIGHT_RANK_1D,
+        "direction_1d": LOSS_WEIGHT_DIRECTION_1D,
+        "log_return_1d": LOSS_WEIGHT_LOG_RETURN_1D,
+        "log_return_3d": LOSS_WEIGHT_LOG_RETURN_3D,
+        "log_return_5d": LOSS_WEIGHT_LOG_RETURN_5D,
+    }
 
-    rank_corrs = []
-    sq_err_sum = 0.0
-    sq_err_count = 0
-
-    for x, y_true in val_ds:
-        preds = model(x, training=False)
-
-        (
-            _,
-            rank_pred,
-            dir_pred,
-            lr1_pred,
-            _,
-            _,
-        ) = preds
-
-        # --- inverse target scaling ---
-        inv = 1.0 / target_scale
-        lr1_pred = lr1_pred * inv
-
-        rank_pred = rank_pred.numpy()
-        dir_pred = dir_pred.numpy()
-        lr1_pred = lr1_pred.numpy()
-
-        rank_true = y_true["rank_1d"].numpy()
-        dir_true = y_true["direction_1d"].numpy()
-        lr1_true = y_true["log_return_1d"].numpy()
-
-        # --- directional accuracy ---
-        dir_pred_bin = (dir_pred > 0.5).astype("int8")
-        dir_correct += (dir_pred_bin == dir_true).sum()
-        dir_total += dir_true.size
-
-        # --- rank spearman (per day) ---
-        for i in range(rank_true.shape[0]):  # batch dimension
-            r_true = rank_true[i]
-            r_pred = rank_pred[i]
-
-            if symbol_count > 1:
-                corr = np.corrcoef(
-                    r_true.argsort(),
-                    r_pred.argsort(),
-                )[0, 1]
-                if not np.isnan(corr):
-                    rank_corrs.append(corr)
-
-        # --- RMSE log return ---
-        diff = lr1_pred - lr1_true
-        sq_err_sum += np.sum(diff * diff)
-        sq_err_count += diff.size
-
-    direction_acc = dir_correct / dir_total if dir_total else 0.0
-    rank_spearman = float(np.mean(rank_corrs)) if rank_corrs else 0.0
-    rmse_log_ret = float(np.sqrt(sq_err_sum / sq_err_count)) if sq_err_count else 0.0
-
-    model_score = (
-        MODEL_SCORE_DIRECTION_ACC_FACTOR * direction_acc
-        + MODEL_SCORE_RANK_SPEARMAN_FACTOR * rank_spearman
-        - MODEL_SCORE_RMSE_LOG_RET_FACTOR * rmse_log_ret
+    best_epoch = min(
+        range(len(history["val_loss"])),
+        key=lambda i: history["val_loss"][i],
     )
 
+    per_head_losses = {
+        name: history[f"val_{name}_loss"][best_epoch] for name in loss_weights
+    }
+
+    weighted_sum = sum(
+        per_head_losses[name] * loss_weights[name] for name in loss_weights
+    )
+
+    weight_sum = sum(loss_weights.values())
+
+    normalized_val_loss = weighted_sum / weight_sum
     return {
-        "direction_acc_1d": float(direction_acc),
-        "rank_spearman_1d": float(rank_spearman),
-        "rmse_log_return_1d": float(rmse_log_ret),
-        "model_score": float(model_score),
+        "normalized_val_loss": normalized_val_loss,
+        "val_losses": per_head_losses,
     }
 
 
@@ -520,7 +479,7 @@ def train():
         del stock_table, news_table, target_table
         gc.collect()
 
-        model.fit(
+        result = model.fit(
             train_ds,
             validation_data=val_ds,
             epochs=EPOCHS,
@@ -540,26 +499,20 @@ def train():
         )
 
         # --- persist ---
-        training_date = date.today().isoformat()
-
-        metrics = evaluate_on_validation(
-            model,
-            val_ds,
-            symbol_count,
-        )
-
-        model_score = f"{metrics['model_score']:.4f}"
+        result_analysis = get_result_analysis(result)
+        model_score = f"{result_analysis["normalized_val_loss"]:.4f}"
 
         model_key = f"{s.MODEL_PREFIX}{model_score}/{s.MODEL_FILE_NAME}"
         meta_key = f"{s.MODEL_PREFIX}{model_score}/{s.META_FILE_NAME}"
 
         write_model_s3(model, model_key)
 
-        meta_out = {
+        meta_data = {
+            "model_score": model_score,
             "symbol_count": symbol_count,
-            "training_date": training_date,
+            "training_date": date.today().isoformat(),
             "validation_size": validation_size,
-            "metrics": metrics,
+            "result_analysis": result_analysis,
             "config": {
                 "batch_size": BATCH_SIZE,
                 "epochs": EPOCHS,
@@ -574,9 +527,11 @@ def train():
                 "shared_trunk_size_1": SHARED_TRUNK_SIZE_1,
                 "shared_trunk_size_2": SHARED_TRUNK_SIZE_2,
                 "learning_rate": LEARNING_RATE,
-                "losses_huber_delta": LOSSES_HUBER_DELTA,
                 "loss_zscore_1d": LOSS_ZSCORE_1D,
-                "loss_rank_1d": str(LOSS_RANK_1D),
+                "loss_rank_1d": {
+                    "type": "Huber",
+                    "delta": LOSSES_HUBER_DELTA,
+                },
                 "loss_direction_1d": LOSS_DIRECTION_1D,
                 "loss_log_return_1d": LOSS_LOG_RETURN_1D,
                 "loss_log_return_3d": LOSS_LOG_RETURN_3D,
@@ -594,7 +549,7 @@ def train():
                 "reduce_lr_on_plateau_min_lr": REDUCE_LR_ON_PLATEAU_MIN_LR,
             },
         }
-        s.write_bytes_s3(meta_key, json.dumps(meta_out).encode("utf-8"))
+        s.write_bytes_s3(meta_key, json.dumps(meta_data).encode("utf-8"))
 
         LOGGER.info("training finished")
 
