@@ -24,7 +24,7 @@ if PARTIAL_FILE_LIMIT < 1:
 
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1"))
 EPOCHS = int(os.getenv("EPOCHS", "50"))
-WINDOW_SIZE = int(os.getenv("WINDOW_SIZE", "10"))
+WINDOW_SIZE = int(os.getenv("WINDOW_SIZE", "20"))
 
 VALIDATION_MAX_RATIO = float(os.getenv("VALIDATION_MAX_RATIO", "0.2"))
 VALIDATION_TO_WINDOW_RATIO = float(os.getenv("VALIDATION_TO_WINDOW_RATIO", "2.0"))
@@ -419,8 +419,15 @@ def get_result_analysis(result) -> dict[str, float | dict[str, float]]:
         name: history[f"val_{name}_loss"][best_epoch] for name in loss_weights
     }
 
+    normalized_losses = {}
+    for name, loss in per_head_losses.items():
+        if name.startswith("log_return"):
+            normalized_losses[name] = loss / s.TARGET_SCALE
+        else:
+            normalized_losses[name] = loss
+
     weighted_sum = sum(
-        per_head_losses[name] * loss_weights[name] for name in loss_weights
+        normalized_losses[name] * loss_weights[name] for name in loss_weights
     )
 
     weight_sum = sum(loss_weights.values())
