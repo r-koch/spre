@@ -87,7 +87,7 @@ def get_best_model_key() -> str:
         if score is None:
             continue
 
-        if best_score is None or score > best_score:
+        if best_score is None or score < best_score:
             best_key = key
             best_score = score
 
