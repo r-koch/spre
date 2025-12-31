@@ -8,6 +8,7 @@ RUN pip install --upgrade pip setuptools wheel
 WORKDIR ${LAMBDA_TASK_ROOT}
 COPY python/inference.py .
 COPY python/shared.py .
+COPY python/shared_model.py .
 COPY docker/inference/requirements.txt .
 
 # Install Python dependencies (with pinned versions)
