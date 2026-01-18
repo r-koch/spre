@@ -1,76 +1,49 @@
 # --- STANDARD ---
-import os
+import copy
 
 # --- PROJECT ---
 
 # --- THIRD-PARTY ---
 import tensorflow as tf
-from tensorflow.keras import layers, losses, models, optimizers  # type: ignore
+from tensorflow.keras import layers, models  # type: ignore
 
 
-STOCK_ATTENTION_HEADS = int(os.getenv("SYMBOL_ATTENTION_HEADS", "4"))
-STOCK_EMBED = int(os.getenv("SYMBOL_EMBED", "32"))
+CONST = {
+    "gru_dropout": 0.1,
+    "post_gru_dropout": 0.1,
+    "symbol_attention_bottleneck_ratio": 0.5,  # low-rank constraint
+    "use_symbol_layer_norm": True,
+    "dense_activation": "relu",
+    "gate_activation": "sigmoid",
+    "news_time_axis": 1,  # time dimension
+    "output_dtype": "float32",
+    "optimizer": "Adam",
+}
 
-if STOCK_EMBED % STOCK_ATTENTION_HEADS != 0:
-    raise ValueError("STOCK_EMBED must be divisible by STOCK_ATTENTION_HEADS")
 
-NEWS_ATTENTION_HEADS = int(os.getenv("NEWS_ATTENTION_HEADS", "4"))
-NEWS_EMBED = int(os.getenv("NEWS_EMBED", "32"))
+VAR = {
+    "stock_embed": 32,
+    "news_embed": 32,
+    "stock_attention_heads": 4,
+    "shared_trunk_size_1": 2048,
+    "shared_trunk_size_2": 1024,
+}
 
-if NEWS_EMBED % NEWS_ATTENTION_HEADS != 0:
-    raise ValueError("NEWS_EMBED must be divisible by NEWS_ATTENTION_HEADS")
+if VAR["stock_embed"] % VAR["stock_attention_heads"] != 0:
+    raise ValueError("stock_embed must be divisible by stock_attention_heads")
 
-SHARED_TRUNK_SIZE_1 = int(os.getenv("SHARED_TRUNK_SIZE_1", "2048"))
-SHARED_TRUNK_SIZE_2 = int(os.getenv("SHARED_TRUNK_SIZE_2", "1024"))
 
-LEARNING_RATE = float(os.getenv("LEARNING_RATE", "1e-3"))
-
-LOSSES_HUBER_DELTA = float(os.getenv("LOSSES_HUBER_DELTA", "0.1"))
-
-LOSS_ZSCORE_1D = os.getenv("LOSS_ZSCORE_1D", "mse")
-LOSS_RANK_1D = losses.Huber(delta=LOSSES_HUBER_DELTA)
-LOSS_DIRECTION_1D = os.getenv("LOSS_DIRECTION_1D", "binary_crossentropy")
-LOSS_LOG_RETURN_1D = os.getenv("LOSS_LOG_RETURN_1D", "mse")
-LOSS_LOG_RETURN_3D = os.getenv("LOSS_LOG_RETURN_3D", "mse")
-LOSS_LOG_RETURN_5D = os.getenv("LOSS_LOG_RETURN_5D", "mse")
-
-LOSS_WEIGHT_ZSCORE_1D = float(os.getenv("LOSS_WEIGHT_ZSCORE_1D", "1.0"))
-LOSS_WEIGHT_RANK_1D = float(os.getenv("LOSS_WEIGHT_RANK_1D", "0.3"))
-LOSS_WEIGHT_DIRECTION_1D = float(os.getenv("LOSS_WEIGHT_DIRECTION_1D", "0.3"))
-LOSS_WEIGHT_LOG_RETURN_1D = float(os.getenv("LOSS_WEIGHT_LOG_RETURN_1D", "0.05"))
-LOSS_WEIGHT_LOG_RETURN_3D = float(os.getenv("LOSS_WEIGHT_LOG_RETURN_3D", "0.05"))
-LOSS_WEIGHT_LOG_RETURN_5D = float(os.getenv("LOSS_WEIGHT_LOG_RETURN_5D", "0.05"))
+if (VAR["stock_embed"] * CONST["symbol_attention_bottleneck_ratio"]) % VAR[
+    "stock_attention_heads"
+] != 0:
+    raise ValueError(
+        "(stock_embed * symbol_attention_bottleneck_ratio) must be divisible by stock_attention_heads"
+    )
 
 
 def build(
     *, time_steps: int, stock_feature_dim: int, news_feature_dim: int, symbol_count: int
 ) -> tuple[models.Model, dict]:
-
-    config = {
-        "stock_attention_heads": STOCK_ATTENTION_HEADS,
-        "stock_embed": STOCK_EMBED,
-        "news_attention_heads": NEWS_ATTENTION_HEADS,
-        "news_embed": NEWS_EMBED,
-        "shared_trunk_size_1": SHARED_TRUNK_SIZE_1,
-        "shared_trunk_size_2": SHARED_TRUNK_SIZE_2,
-        "optimizer": "Adam",
-        "learning_rate": LEARNING_RATE,
-        "loss_zscore_1d": LOSS_ZSCORE_1D,
-        "loss_rank_1d": {
-            "type": "Huber",
-            "delta": LOSSES_HUBER_DELTA,
-        },
-        "loss_direction_1d": LOSS_DIRECTION_1D,
-        "loss_log_return_1d": LOSS_LOG_RETURN_1D,
-        "loss_log_return_3d": LOSS_LOG_RETURN_3D,
-        "loss_log_return_5d": LOSS_LOG_RETURN_5D,
-        "loss_weight_zscore_1d": LOSS_WEIGHT_ZSCORE_1D,
-        "loss_weight_rank_1d": LOSS_WEIGHT_RANK_1D,
-        "loss_weight_direction_1d": LOSS_WEIGHT_DIRECTION_1D,
-        "loss_weight_log_return_1d": LOSS_WEIGHT_LOG_RETURN_1D,
-        "loss_weight_log_return_3d": LOSS_WEIGHT_LOG_RETURN_3D,
-        "loss_weight_log_return_5d": LOSS_WEIGHT_LOG_RETURN_5D,
-    }
 
     # ============================================================
     # INPUTS
@@ -84,108 +57,162 @@ def build(
     # STOCK: PER-SYMBOL PROJECTION
     # ============================================================
     x = layers.TimeDistributed(
-        layers.TimeDistributed(layers.Dense(config["stock_embed"], activation="relu"))
+        layers.TimeDistributed(
+            layers.Dense(
+                VAR["stock_embed"],
+                activation=CONST["dense_activation"],
+            )
+        )
     )(stock_in)
     # (batch, time, symbols, embed)
 
     # ============================================================
     # STOCK: TEMPORAL REGIME (GRU)
     # ============================================================
-    x = layers.Reshape((-1, time_steps, config["stock_embed"]))(x)
+
+    x = layers.Permute((2, 1, 3), name="to_symbol_major")(x)
+    # (batch, symbols, time, embed)
+
+    x = layers.Lambda(
+        lambda t: tf.reshape(t, (-1, time_steps, VAR["stock_embed"])),
+        name="merge_batch_and_symbols",
+    )(x)
+    # (batch * symbols, time, embed)
+
     x = layers.GRU(
-        config["stock_embed"],
+        VAR["stock_embed"],
         return_sequences=False,
-        dropout=0.1,
-        recurrent_dropout=0.0,
+        dropout=CONST["gru_dropout"],
         name="stock_gru",
     )(x)
-    x = layers.Dropout(0.1)(x)
-    x = layers.Reshape((-1, symbol_count, config["stock_embed"]))(x)
+
+    x = layers.Dropout(CONST["post_gru_dropout"])(x)
+
+    x = layers.Lambda(
+        lambda t: tf.reshape(t, (-1, symbol_count, VAR["stock_embed"])),
+        name="restore_symbol_axis",
+    )(x)
     # (batch, symbols, embed)
 
     # ============================================================
-    # SECTOR EMBEDDINGS (SYMBOL INDUCTIVE BIAS)
+    # CROSS-SYMBOL ATTENTION (LOW-RANK, STABILIZED)
     # ============================================================
-    # assumes sector indices are provided externally in fixed order
-    sector_ids = tf.range(symbol_count)
-    sector_embed = layers.Embedding(
-        input_dim=symbol_count,
-        output_dim=config["stock_embed"],
-        name="sector_embedding",
-    )(sector_ids)
-    sector_embed = tf.expand_dims(sector_embed, axis=0)
+    if CONST["use_symbol_layer_norm"]:
+        x = layers.LayerNormalization(name="symbol_ln")(x)
 
-    x = layers.Add()([x, sector_embed])
+    bottleneck_dim = int(
+        VAR["stock_embed"] * CONST["symbol_attention_bottleneck_ratio"]
+    )
 
-    # ============================================================
-    # CROSS-SYMBOL ATTENTION (LOW-RANK)
-    # ============================================================
     bottleneck = layers.Dense(
-        config["stock_embed"] // 2, activation="relu", name="symbol_bottleneck"
+        bottleneck_dim,
+        activation=CONST["dense_activation"],
+        name="symbol_bottleneck",
     )(x)
 
+    key_dim = bottleneck_dim // VAR["stock_attention_heads"]
+
     x = layers.MultiHeadAttention(
-        num_heads=2,
-        key_dim=(config["stock_embed"] // 2) // 2,
+        num_heads=VAR["stock_attention_heads"],
+        key_dim=key_dim,
         name="symbol_attention",
     )(bottleneck, bottleneck)
 
-    x = layers.Dense(config["stock_embed"], activation="relu")(x)
-    stock_repr = x
+    stock_repr = layers.Dense(
+        VAR["stock_embed"],
+        activation=CONST["dense_activation"],
+        name="stock_post_attention",
+    )(x)
     # (batch, symbols, embed)
+
+    # ============================================================
+    # SYMBOL GATING (ARCHITECTURAL)
+    # ============================================================
+    symbol_gate = layers.Dense(
+        1,
+        activation=CONST["gate_activation"],
+        name="symbol_gate",
+    )(stock_repr)
+
+    stock_repr = layers.Multiply(name="stock_gated")([stock_repr, symbol_gate])
 
     # ============================================================
     # NEWS: TEMPORAL DECAY / GATING
     # ============================================================
-    gate_logits = layers.Dense(1, name="news_time_gate")(news_in)
-    gate = layers.Softmax(axis=1)(gate_logits)
-    gated_news = layers.Multiply()([news_in, gate])
+    gate_logits = layers.Dense(
+        1,
+        name="news_time_gate",
+    )(news_in)
+
+    gate = layers.Softmax(
+        axis=CONST["news_time_axis"],
+        name="news_time_softmax",
+    )(gate_logits)
+
+    gated_news = layers.Multiply(name="news_time_gated")([news_in, gate])
 
     news_base = layers.Dense(
-        config["news_embed"], activation="relu", name="news_base_embed"
+        VAR["news_embed"],
+        activation=CONST["dense_activation"],
+        name="news_base_embed",
     )(gated_news)
-    news_base = layers.GlobalAveragePooling1D()(news_base)
+
+    news_base = layers.GlobalAveragePooling1D(name="news_time_pool")(news_base)
     # (batch, news_embed)
 
     # ============================================================
     # NEWS: REGIME CONDITIONING
     # ============================================================
-    regime = layers.GlobalAveragePooling1D()(stock_repr)
+    regime = layers.GlobalAveragePooling1D(name="regime_pool")(stock_repr)
+
     regime_gate = layers.Dense(
-        config["news_embed"], activation="sigmoid", name="news_regime_gate"
+        VAR["news_embed"],
+        activation=CONST["gate_activation"],
+        name="news_regime_gate",
     )(regime)
 
-    news_conditioned = layers.Multiply()([news_base, regime_gate])
+    news_conditioned = layers.Multiply(name="news_conditioned")(
+        [news_base, regime_gate]
+    )
 
     # ============================================================
     # NEWS: SYMBOL-AWARE ATTRIBUTION
     # ============================================================
     news_sym = layers.Dense(
-        symbol_count * config["news_embed"],
-        activation="relu",
+        symbol_count * VAR["news_embed"],
+        activation=CONST["dense_activation"],
         name="news_symbol_projection",
     )(news_conditioned)
 
-    news_sym = layers.Reshape((symbol_count, config["news_embed"]))(news_sym)
+    news_sym = layers.Reshape(
+        (symbol_count, VAR["news_embed"]),
+        name="news_per_symbol",
+    )(news_sym)
 
     # ============================================================
-    # FUSION (SYMBOL-WISE)
+    # FUSION
     # ============================================================
-    fused = layers.Concatenate(axis=-1)([stock_repr, news_sym])
+    fused = layers.Concatenate(
+        axis=-1,
+        name="symbol_fusion",
+    )([stock_repr, news_sym])
 
-    # ============================================================
-    # SYMBOL GATING BEFORE COMPRESSION
-    # ============================================================
-    symbol_gate = layers.Dense(1, activation="sigmoid", name="symbol_gate")(fused)
-    fused = layers.Multiply()([fused, symbol_gate])
-
-    fused = layers.Flatten()(fused)
+    fused = layers.Flatten(name="fusion_flatten")(fused)
 
     # ============================================================
     # SHARED TRUNK
     # ============================================================
-    shared = layers.Dense(config["shared_trunk_size_1"], activation="relu")(fused)
-    shared = layers.Dense(config["shared_trunk_size_2"], activation="relu")(shared)
+    shared = layers.Dense(
+        VAR["shared_trunk_size_1"],
+        activation=CONST["dense_activation"],
+        name="shared_dense_1",
+    )(fused)
+
+    shared = layers.Dense(
+        VAR["shared_trunk_size_2"],
+        activation=CONST["dense_activation"],
+        name="shared_dense_2",
+    )(shared)
 
     # ============================================================
     # HEADS
@@ -195,13 +222,13 @@ def build(
             symbol_count,
             activation=activation,
             name=name,
-            dtype="float32",
+            dtype=CONST["output_dtype"],
         )(shared)
 
     outputs = {
         "zscore_1d": head("zscore_1d"),
         "rank_1d": head("rank_1d"),
-        "direction_1d": head("direction_1d", activation="sigmoid"),
+        "direction_1d": head("direction_1d", activation=CONST["gate_activation"]),
         "log_return_1d": head("log_return_1d"),
         "log_return_3d": head("log_return_3d"),
         "log_return_5d": head("log_return_5d"),
@@ -212,24 +239,9 @@ def build(
         outputs=outputs,
     )
 
-    model.compile(
-        optimizer=optimizers.Adam(config["learning_rate"]),
-        loss={
-            "zscore_1d": config["loss_zscore_1d"],
-            "rank_1d": config["loss_rank_1d"],
-            "direction_1d": config["loss_direction_1d"],
-            "log_return_1d": config["loss_log_return_1d"],
-            "log_return_3d": config["loss_log_return_3d"],
-            "log_return_5d": config["loss_log_return_5d"],
-        },
-        loss_weights={
-            "zscore_1d": config["loss_weight_zscore_1d"],
-            "rank_1d": config["loss_weight_rank_1d"],
-            "direction_1d": config["loss_weight_direction_1d"],
-            "log_return_1d": config["loss_weight_log_return_1d"],
-            "log_return_3d": config["loss_weight_log_return_3d"],
-            "log_return_5d": config["loss_weight_log_return_5d"],
-        },
-    )
+    config = {
+        "constants": copy.deepcopy(CONST),
+        "variables": copy.deepcopy(VAR),
+    }
 
     return model, config
