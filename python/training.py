@@ -1,4 +1,5 @@
 # --- STANDARD ---
+import copy
 import gc
 import json
 import os
@@ -13,6 +14,7 @@ import shared as s
 import numpy as np
 import pyarrow as pa
 import tensorflow as tf
+from tensorflow.keras import losses, optimizers  # type: ignore
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau  # type: ignore
 
 # --- CONFIG ---
@@ -21,27 +23,39 @@ PARTIAL_FILE_LIMIT = int(os.getenv("PARTIAL_FILE_LIMIT", "1"))
 if PARTIAL_FILE_LIMIT < 1:
     raise ValueError("PARTIAL_FILE_LIMIT must be > 0")
 
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "32"))
-EPOCHS = int(os.getenv("EPOCHS", "50"))
-WINDOW_SIZE = int(os.getenv("WINDOW_SIZE", "30"))
+CONFIG = {
+    "batch_size": 32,
+    "epochs": 50,
+    "window_size": 30,
+    "validation_max_ratio": 0.2,
+    "validation_to_window_ratio": 2.0,
+    "target_scale_clip_factor": 10.0,
+    # compile
+    "learning_rate": 1e-3,
+    "loss": {
+        "zscore_1d": "mse",
+        "rank_1d": losses.Huber(delta=0.1),
+        "direction_1d": "binary_crossentropy",
+        "log_return_1d": "mse",
+        "log_return_3d": "mse",
+        "log_return_5d": "mse",
+    },
+    "loss_weights": {
+        "zscore_1d": 1.0,
+        "rank_1d": 0.3,
+        "direction_1d": 0.3,
+        "log_return_1d": 0.05,
+        "log_return_3d": 0.05,
+        "log_return_5d": 0.05,
+    },
+    # fit
+    "early_stopping_patience": 16,
+    "early_stopping_restore_best_weigths": True,
+    "reduce_lr_on_plateau_factor": 0.5,
+    "reduce_lr_on_plateau_patience": 8,
+    "reduce_lr_on_plateau_min_lr": 1e-5,
+}
 
-VALIDATION_MAX_RATIO = float(os.getenv("VALIDATION_MAX_RATIO", "0.2"))
-VALIDATION_TO_WINDOW_RATIO = float(os.getenv("VALIDATION_TO_WINDOW_RATIO", "2.0"))
-
-TARGET_SCALE_CLIP_FACTOR = float(os.getenv("TARGET_SCALE_CLIP_FACTOR", "10.0"))
-
-EARLY_STOPPING_PATIENCE = int(os.getenv("EARLY_STOPPING_PATIENCE", "25"))
-EARLY_STOPPING_RESTORE_BEST_WEIGTHS = bool(
-    os.getenv("EARLY_STOPPING_RESTORE_BEST_WEIGTHS", "True")
-)  # empty for False
-
-REDUCE_LR_ON_PLATEAU_FACTOR = float(os.getenv("REDUCE_LR_ON_PLATEAU_FACTOR", "0.5"))
-REDUCE_LR_ON_PLATEAU_PATIENCE = int(os.getenv("REDUCE_LR_ON_PLATEAU_PATIENCE", "8"))
-REDUCE_LR_ON_PLATEAU_MIN_LR = float(os.getenv("REDUCE_LR_ON_PLATEAU_MIN_LR", "1e-5"))
-
-MODEL_SCORE_DIRECTION_ACC_FACTOR = 0.50
-MODEL_SCORE_RANK_SPEARMAN_FACTOR = 0.30
-MODEL_SCORE_RMSE_LOG_RET_FACTOR = 0.20
 
 LOGGER = s.setup_logger(__file__)
 
@@ -130,7 +144,7 @@ def build_training_dataset(
 ) -> tuple[tf.data.Dataset, int, int, int]:
     symbols = s.get_symbols()
     symbol_count = len(symbols)
-    window = WINDOW_SIZE
+    window_size = CONFIG["window_size"]
 
     stock_feature_count = len(s.PIVOTED_FEATURES)
     news_feature_count = news_table.num_columns - 1
@@ -168,14 +182,14 @@ def build_training_dataset(
     day_count = stock_table.num_rows
 
     def gen():
-        for t in range(window, day_count):
+        for t in range(window_size, day_count):
             stock_window = np.stack(
-                [col[t - window : t] for col in stock_columns],
+                [col[t - window_size : t] for col in stock_columns],
                 axis=1,
-            ).reshape(window, symbol_count, stock_feature_count)
+            ).reshape(window_size, symbol_count, stock_feature_count)
 
             news_window = np.stack(
-                [col[t - window : t] for col in news_columns],
+                [col[t - window_size : t] for col in news_columns],
                 axis=1,
             )
 
@@ -200,9 +214,9 @@ def build_training_dataset(
     output_signature = (
         {
             "stock": tf.TensorSpec(
-                (window, symbol_count, stock_feature_count), tf.float32  # type: ignore
+                (window_size, symbol_count, stock_feature_count), tf.float32  # type: ignore
             ),
-            "news": tf.TensorSpec((window, news_feature_count), tf.float32),  # type: ignore
+            "news": tf.TensorSpec((window_size, news_feature_count), tf.float32),  # type: ignore
         },
         {
             "zscore_1d": tf.TensorSpec((symbol_count,), tf.float32),  # type: ignore
@@ -215,7 +229,7 @@ def build_training_dataset(
     )
 
     ds = tf.data.Dataset.from_generator(gen, output_signature=output_signature)
-    ds = ds.batch(BATCH_SIZE, drop_remainder=True).prefetch(tf.data.AUTOTUNE)
+    ds = ds.batch(CONFIG["batch_size"], drop_remainder=True).prefetch(tf.data.AUTOTUNE)
 
     return ds, stock_feature_count, news_feature_count, symbol_count
 
@@ -240,7 +254,7 @@ def scale_targets(x, y):
     y["log_return_3d"] *= target_scale
     y["log_return_5d"] *= target_scale
 
-    clip = TARGET_SCALE_CLIP_FACTOR * target_scale
+    clip = CONFIG["target_scale_clip_factor"] * target_scale
     y["log_return_1d"] = tf.clip_by_value(y["log_return_1d"], -clip, clip)
     y["log_return_3d"] = tf.clip_by_value(y["log_return_3d"], -clip, clip)
     y["log_return_5d"] = tf.clip_by_value(y["log_return_5d"], -clip, clip)
@@ -252,9 +266,10 @@ def split_train_validation(
     stock_table: pa.Table, news_table: pa.Table, target_table: pa.Table
 ) -> tuple[pa.Table, pa.Table, pa.Table, pa.Table, pa.Table, pa.Table, int]:
     n = stock_table.num_rows
+    window_size = CONFIG["window_size"]
 
-    min_val = WINDOW_SIZE * VALIDATION_TO_WINDOW_RATIO
-    max_val = int(n * VALIDATION_MAX_RATIO)
+    min_val = window_size * CONFIG["validation_to_window_ratio"]
+    max_val = int(n * CONFIG["validation_max_ratio"])
 
     if max_val < min_val:
         raise ValueError(
@@ -264,19 +279,19 @@ def split_train_validation(
 
     val_start = n - max_val
 
-    if val_start < WINDOW_SIZE:
+    if val_start < window_size:
         raise ValueError(
             f"Training set too small after split: "
-            f"val_start={val_start}, window_size={WINDOW_SIZE}"
+            f"val_start={val_start}, window_size={window_size}"
         )
 
     return (
         stock_table.slice(0, val_start),
         news_table.slice(0, val_start),
         target_table.slice(0, val_start),
-        stock_table.slice(val_start - WINDOW_SIZE),
-        news_table.slice(val_start - WINDOW_SIZE),
-        target_table.slice(val_start - WINDOW_SIZE),
+        stock_table.slice(val_start - window_size),
+        news_table.slice(val_start - window_size),
+        target_table.slice(val_start - window_size),
         max_val,
     )
 
@@ -344,17 +359,23 @@ def train():
 
         val_ds, _, _, _ = build_training_dataset(stock_val, news_val, target_val)
 
-        train_ds = train_ds.map(scale_targets, num_parallel_calls=1)
-        val_ds = val_ds.map(scale_targets, num_parallel_calls=1)
+        train_ds = train_ds.map(scale_targets, num_parallel_calls=tf.data.AUTOTUNE)
+        val_ds = val_ds.map(scale_targets, num_parallel_calls=tf.data.AUTOTUNE)
 
         model, model_config = builder.build(
-            time_steps=WINDOW_SIZE,
+            time_steps=CONFIG["window_size"],
             stock_feature_dim=stock_feature_count,
             news_feature_dim=news_feature_count,
             symbol_count=symbol_count,
         )
 
-        LOGGER.info(model.summary())
+        model.compile(
+            optimizer=optimizers.Adam(CONFIG["learning_rate"]),
+            loss=CONFIG["loss"],
+            loss_weights=CONFIG["loss_weights"],
+        )
+
+        model.summary(print_fn=LOGGER.info)
 
         # keep only what fit needs
         del stock_table, news_table, target_table
@@ -363,18 +384,18 @@ def train():
         result = model.fit(
             train_ds,
             validation_data=val_ds,
-            epochs=EPOCHS,
+            epochs=CONFIG["epochs"],
             callbacks=[
                 EarlyStopping(
                     monitor="val_loss",
-                    patience=EARLY_STOPPING_PATIENCE,
+                    patience=CONFIG["early_stopping_patience"],
                     restore_best_weights=True,
                 ),
                 ReduceLROnPlateau(
                     monitor="val_loss",
-                    factor=REDUCE_LR_ON_PLATEAU_FACTOR,
-                    patience=REDUCE_LR_ON_PLATEAU_PATIENCE,
-                    min_lr=REDUCE_LR_ON_PLATEAU_MIN_LR,
+                    factor=CONFIG["reduce_lr_on_plateau_factor"],
+                    patience=CONFIG["reduce_lr_on_plateau_patience"],
+                    min_lr=CONFIG["reduce_lr_on_plateau_min_lr"],
                 ),
             ],
         )
@@ -398,23 +419,11 @@ def train():
                 "date": date.today().isoformat(),
                 "symbol_count": symbol_count,
                 "validation_size": validation_size,
+                "config": copy.deepcopy(CONFIG),
                 "result_analysis": result_analysis,
-                "config": {
-                    "batch_size": BATCH_SIZE,
-                    "epochs": EPOCHS,
-                    "window_size": WINDOW_SIZE,
-                    "validation_max_ratio": VALIDATION_MAX_RATIO,
-                    "validation_to_window_ratio": VALIDATION_TO_WINDOW_RATIO,
-                    "target_scale_clip_factor": TARGET_SCALE_CLIP_FACTOR,
-                    "early_stopping_patience": EARLY_STOPPING_PATIENCE,
-                    "early_stopping_restore_best_weigths": EARLY_STOPPING_RESTORE_BEST_WEIGTHS,
-                    "reduce_lr_on_plateau_factor": REDUCE_LR_ON_PLATEAU_FACTOR,
-                    "reduce_lr_on_plateau_patience": REDUCE_LR_ON_PLATEAU_PATIENCE,
-                    "reduce_lr_on_plateau_min_lr": REDUCE_LR_ON_PLATEAU_MIN_LR,
-                },
             },
         }
-        s.write_bytes_s3(meta_key, json.dumps(meta_data).encode("utf-8"))
+        s.write_bytes_s3(meta_key, json.dumps(meta_data, default=str).encode("utf-8"))
 
         LOGGER.info("training finished")
 
