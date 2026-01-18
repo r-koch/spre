@@ -16,12 +16,12 @@ VAR = {
 }
 
 
-if VAR["STOCK_EMBED"] % VAR["STOCK_ATTENTION_HEADS"] != 0:
-    raise ValueError("STOCK_EMBED must be divisible by STOCK_ATTENTION_HEADS")
+if VAR["stock_embed"] % VAR["stock_attention_heads"] != 0:
+    raise ValueError("stock_embed must be divisible by stock_attention_heads")
 
 
-if VAR["NEWS_EMBED"] % VAR["NEWS_ATTENTION_HEADS"] != 0:
-    raise ValueError("NEWS_EMBED must be divisible by NEWS_ATTENTION_HEADS")
+if VAR["news_embed"] % VAR["news_attention_heads"] != 0:
+    raise ValueError("news_embed must be divisible by news_attention_heads")
 
 
 def build(
