@@ -6,14 +6,13 @@ import tempfile
 from datetime import date
 
 # --- PROJECT ---
+import model1 as builder
 import shared as s
-import shared_model as sm
 
 # --- THIRD-PARTY ---
 import numpy as np
 import pyarrow as pa
 import tensorflow as tf
-from tensorflow.keras import layers, losses, models, optimizers  # type: ignore
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau  # type: ignore
 
 # --- CONFIG ---
@@ -30,33 +29,6 @@ VALIDATION_MAX_RATIO = float(os.getenv("VALIDATION_MAX_RATIO", "0.2"))
 VALIDATION_TO_WINDOW_RATIO = float(os.getenv("VALIDATION_TO_WINDOW_RATIO", "2.0"))
 
 TARGET_SCALE_CLIP_FACTOR = float(os.getenv("TARGET_SCALE_CLIP_FACTOR", "10.0"))
-
-STOCK_ATTENTION_HEADS = int(os.getenv("SYMBOL_ATTENTION_HEADS", "4"))
-STOCK_EMBED = int(os.getenv("SYMBOL_EMBED", "32"))
-
-NEWS_ATTENTION_HEADS = int(os.getenv("NEWS_ATTENTION_HEADS", "4"))
-NEWS_EMBED = int(os.getenv("NEWS_EMBED", "32"))
-
-SHARED_TRUNK_SIZE_1 = int(os.getenv("SHARED_TRUNK_SIZE_1", "2048"))
-SHARED_TRUNK_SIZE_2 = int(os.getenv("SHARED_TRUNK_SIZE_2", "1024"))
-
-LEARNING_RATE = float(os.getenv("LEARNING_RATE", "1e-3"))
-
-LOSSES_HUBER_DELTA = float(os.getenv("LOSSES_HUBER_DELTA", "0.1"))
-
-LOSS_ZSCORE_1D = os.getenv("LOSS_ZSCORE_1D", "mse")
-LOSS_RANK_1D = losses.Huber(delta=LOSSES_HUBER_DELTA)
-LOSS_DIRECTION_1D = os.getenv("LOSS_DIRECTION_1D", "binary_crossentropy")
-LOSS_LOG_RETURN_1D = os.getenv("LOSS_LOG_RETURN_1D", "mse")
-LOSS_LOG_RETURN_3D = os.getenv("LOSS_LOG_RETURN_3D", "mse")
-LOSS_LOG_RETURN_5D = os.getenv("LOSS_LOG_RETURN_5D", "mse")
-
-LOSS_WEIGHT_ZSCORE_1D = float(os.getenv("LOSS_WEIGHT_ZSCORE_1D", "1.0"))
-LOSS_WEIGHT_RANK_1D = float(os.getenv("LOSS_WEIGHT_RANK_1D", "0.3"))
-LOSS_WEIGHT_DIRECTION_1D = float(os.getenv("LOSS_WEIGHT_DIRECTION_1D", "0.3"))
-LOSS_WEIGHT_LOG_RETURN_1D = float(os.getenv("LOSS_WEIGHT_LOG_RETURN_1D", "0.05"))
-LOSS_WEIGHT_LOG_RETURN_3D = float(os.getenv("LOSS_WEIGHT_LOG_RETURN_3D", "0.05"))
-LOSS_WEIGHT_LOG_RETURN_5D = float(os.getenv("LOSS_WEIGHT_LOG_RETURN_5D", "0.05"))
 
 EARLY_STOPPING_PATIENCE = int(os.getenv("EARLY_STOPPING_PATIENCE", "25"))
 EARLY_STOPPING_RESTORE_BEST_WEIGTHS = bool(
@@ -248,95 +220,6 @@ def build_training_dataset(
     return ds, stock_feature_count, news_feature_count, symbol_count
 
 
-def build_model(
-    time_steps: int, stock_feature_dim: int, news_feature_dim: int, symbol_count: int
-) -> models.Model:
-
-    stock_in = layers.Input(
-        shape=(time_steps, symbol_count, stock_feature_dim), name="stock"
-    )
-    news_in = layers.Input(shape=(time_steps, news_feature_dim), name="news")
-
-    # --- per-symbol projection ---
-    x = layers.TimeDistributed(
-        layers.TimeDistributed(layers.Dense(STOCK_EMBED, activation="relu"))
-    )(stock_in)
-    # (batch, time, symbols, embed)
-
-    # --- pool symbols ---
-    x = sm.MeanOverSymbols(name="pool_symbols")(x)
-
-    # (batch, time, embed)
-
-    # --- temporal attention only ---
-    x = layers.MultiHeadAttention(
-        num_heads=STOCK_ATTENTION_HEADS,
-        key_dim=STOCK_EMBED // STOCK_ATTENTION_HEADS,
-    )(x, x)
-    # (batch, time, embed)
-
-    # --- pool time ---
-    x = layers.GlobalAveragePooling1D()(x)
-    # (batch, embed)
-
-    # --- news encoder ---
-    y = layers.MultiHeadAttention(
-        num_heads=NEWS_ATTENTION_HEADS,
-        key_dim=NEWS_EMBED,
-    )(news_in, news_in)
-    y = layers.GlobalAveragePooling1D()(y)
-
-    # --- fuse ---
-    x = layers.Concatenate()([x, y])
-
-    # --- shared trunk ---
-    shared = layers.Dense(SHARED_TRUNK_SIZE_1, activation="relu")(x)
-    shared = layers.Dense(SHARED_TRUNK_SIZE_2, activation="relu")(shared)
-
-    # --- heads ---
-    def head(name, activation=None):
-        return layers.Dense(
-            symbol_count,
-            activation=activation,
-            name=name,
-            dtype="float32",
-        )(shared)
-
-    model = models.Model(
-        inputs=[stock_in, news_in],
-        outputs=[
-            head("zscore_1d"),
-            head("rank_1d"),
-            head("direction_1d", activation="sigmoid"),
-            head("log_return_1d"),
-            head("log_return_3d"),
-            head("log_return_5d"),
-        ],
-    )
-
-    model.compile(
-        optimizer=optimizers.Adam(LEARNING_RATE),
-        loss={
-            "zscore_1d": LOSS_ZSCORE_1D,
-            "rank_1d": LOSS_RANK_1D,
-            "direction_1d": LOSS_DIRECTION_1D,
-            "log_return_1d": LOSS_LOG_RETURN_1D,
-            "log_return_3d": LOSS_LOG_RETURN_3D,
-            "log_return_5d": LOSS_LOG_RETURN_5D,
-        },
-        loss_weights={
-            "zscore_1d": LOSS_WEIGHT_ZSCORE_1D,
-            "rank_1d": LOSS_WEIGHT_RANK_1D,
-            "direction_1d": LOSS_WEIGHT_DIRECTION_1D,
-            "log_return_1d": LOSS_WEIGHT_LOG_RETURN_1D,
-            "log_return_3d": LOSS_WEIGHT_LOG_RETURN_3D,
-            "log_return_5d": LOSS_WEIGHT_LOG_RETURN_5D,
-        },
-    )
-
-    return model
-
-
 def write_model_s3(model, model_key):
     with tempfile.TemporaryDirectory() as tmp:
         local_model_path = os.path.join(tmp, s.MODEL_FILE_NAME)
@@ -398,17 +281,8 @@ def split_train_validation(
     )
 
 
-def get_result_analysis(result) -> dict[str, float | dict[str, float]]:
+def get_result_analysis(loss_weights, result) -> dict[str, float | dict[str, float]]:
     history = result.history
-
-    loss_weights = {
-        "zscore_1d": LOSS_WEIGHT_ZSCORE_1D,
-        "rank_1d": LOSS_WEIGHT_RANK_1D,
-        "direction_1d": LOSS_WEIGHT_DIRECTION_1D,
-        "log_return_1d": LOSS_WEIGHT_LOG_RETURN_1D,
-        "log_return_3d": LOSS_WEIGHT_LOG_RETURN_3D,
-        "log_return_5d": LOSS_WEIGHT_LOG_RETURN_5D,
-    }
 
     best_epoch = min(
         range(len(history["val_loss"])),
@@ -473,7 +347,7 @@ def train():
         train_ds = train_ds.map(scale_targets, num_parallel_calls=1)
         val_ds = val_ds.map(scale_targets, num_parallel_calls=1)
 
-        model = build_model(
+        model, model_config = builder.build(
             time_steps=WINDOW_SIZE,
             stock_feature_dim=stock_feature_count,
             news_feature_dim=news_feature_count,
@@ -506,7 +380,7 @@ def train():
         )
 
         # --- persist ---
-        result_analysis = get_result_analysis(result)
+        result_analysis = get_result_analysis(model.loss_weights, result)
         model_score = f"{result_analysis["normalized_val_loss"]:.4f}"
 
         model_key = f"{s.MODEL_PREFIX}{model_score}/{s.MODEL_FILE_NAME}"
@@ -515,45 +389,29 @@ def train():
         write_model_s3(model, model_key)
 
         meta_data = {
-            "model_score": model_score,
-            "symbol_count": symbol_count,
-            "training_date": date.today().isoformat(),
-            "validation_size": validation_size,
-            "result_analysis": result_analysis,
-            "config": {
-                "batch_size": BATCH_SIZE,
-                "epochs": EPOCHS,
-                "window_size": WINDOW_SIZE,
-                "validation_max_ratio": VALIDATION_MAX_RATIO,
-                "validation_to_window_ratio": VALIDATION_TO_WINDOW_RATIO,
-                "target_scale_clip_factor": TARGET_SCALE_CLIP_FACTOR,
-                "stock_attention_heads": STOCK_ATTENTION_HEADS,
-                "stock_embed": STOCK_EMBED,
-                "news_attention_heads": NEWS_ATTENTION_HEADS,
-                "news_embed": NEWS_EMBED,
-                "shared_trunk_size_1": SHARED_TRUNK_SIZE_1,
-                "shared_trunk_size_2": SHARED_TRUNK_SIZE_2,
-                "learning_rate": LEARNING_RATE,
-                "loss_zscore_1d": LOSS_ZSCORE_1D,
-                "loss_rank_1d": {
-                    "type": "Huber",
-                    "delta": LOSSES_HUBER_DELTA,
+            "model": {
+                "name": builder.__name__,
+                "config": model_config,
+                "score": model_score,
+            },
+            "training": {
+                "date": date.today().isoformat(),
+                "symbol_count": symbol_count,
+                "validation_size": validation_size,
+                "result_analysis": result_analysis,
+                "config": {
+                    "batch_size": BATCH_SIZE,
+                    "epochs": EPOCHS,
+                    "window_size": WINDOW_SIZE,
+                    "validation_max_ratio": VALIDATION_MAX_RATIO,
+                    "validation_to_window_ratio": VALIDATION_TO_WINDOW_RATIO,
+                    "target_scale_clip_factor": TARGET_SCALE_CLIP_FACTOR,
+                    "early_stopping_patience": EARLY_STOPPING_PATIENCE,
+                    "early_stopping_restore_best_weigths": EARLY_STOPPING_RESTORE_BEST_WEIGTHS,
+                    "reduce_lr_on_plateau_factor": REDUCE_LR_ON_PLATEAU_FACTOR,
+                    "reduce_lr_on_plateau_patience": REDUCE_LR_ON_PLATEAU_PATIENCE,
+                    "reduce_lr_on_plateau_min_lr": REDUCE_LR_ON_PLATEAU_MIN_LR,
                 },
-                "loss_direction_1d": LOSS_DIRECTION_1D,
-                "loss_log_return_1d": LOSS_LOG_RETURN_1D,
-                "loss_log_return_3d": LOSS_LOG_RETURN_3D,
-                "loss_log_return_5d": LOSS_LOG_RETURN_5D,
-                "loss_weight_zscore_1d": LOSS_WEIGHT_ZSCORE_1D,
-                "loss_weight_rank_1d": LOSS_WEIGHT_RANK_1D,
-                "loss_weight_direction_1d": LOSS_WEIGHT_DIRECTION_1D,
-                "loss_weight_log_return_1d": LOSS_WEIGHT_LOG_RETURN_1D,
-                "loss_weight_log_return_3d": LOSS_WEIGHT_LOG_RETURN_3D,
-                "loss_weight_log_return_5d": LOSS_WEIGHT_LOG_RETURN_5D,
-                "early_stopping_patience": EARLY_STOPPING_PATIENCE,
-                "early_stopping_restore_best_weigths": EARLY_STOPPING_RESTORE_BEST_WEIGTHS,
-                "reduce_lr_on_plateau_factor": REDUCE_LR_ON_PLATEAU_FACTOR,
-                "reduce_lr_on_plateau_patience": REDUCE_LR_ON_PLATEAU_PATIENCE,
-                "reduce_lr_on_plateau_min_lr": REDUCE_LR_ON_PLATEAU_MIN_LR,
             },
         }
         s.write_bytes_s3(meta_key, json.dumps(meta_data).encode("utf-8"))
