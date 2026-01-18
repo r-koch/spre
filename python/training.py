@@ -296,8 +296,10 @@ def split_train_validation(
     )
 
 
-def get_result_analysis(loss_weights, result) -> dict[str, float | dict[str, float]]:
+def get_result_analysis(result) -> dict[str, float | dict[str, float]]:
     history = result.history
+
+    loss_weights = CONFIG["loss_weights"]
 
     best_epoch = min(
         range(len(history["val_loss"])),
@@ -401,7 +403,7 @@ def train():
         )
 
         # --- persist ---
-        result_analysis = get_result_analysis(model.loss_weights, result)
+        result_analysis = get_result_analysis(result)
         model_score = f"{result_analysis["normalized_val_loss"]:.4f}"
 
         model_key = f"{s.MODEL_PREFIX}{model_score}/{s.MODEL_FILE_NAME}"
