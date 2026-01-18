@@ -7,7 +7,7 @@ import tempfile
 from datetime import date
 
 # --- PROJECT ---
-import model1 as builder
+import model2 as builder
 import shared as s
 
 # --- THIRD-PARTY ---
@@ -50,7 +50,7 @@ CONFIG = {
     },
     # fit
     "early_stopping_patience": 16,
-    "early_stopping_restore_best_weigths": True,
+    "early_stopping_restore_best_weights": True,
     "reduce_lr_on_plateau_factor": 0.5,
     "reduce_lr_on_plateau_patience": 8,
     "reduce_lr_on_plateau_min_lr": 1e-5,
@@ -391,7 +391,7 @@ def train():
                 EarlyStopping(
                     monitor="val_loss",
                     patience=CONFIG["early_stopping_patience"],
-                    restore_best_weights=True,
+                    restore_best_weights=CONFIG["early_stopping_restore_best_weights"],
                 ),
                 ReduceLROnPlateau(
                     monitor="val_loss",
